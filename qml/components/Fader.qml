@@ -120,8 +120,10 @@ Item {
             root.moved(nextValue)
         }
 
-        onPressed: applyPosition(mouse.y)
-        onPositionChanged: {
+        onPressed: function(mouse) {
+            applyPosition(mouse.y)
+        }
+        onPositionChanged: function(mouse) {
             if (pressed)
                 applyPosition(mouse.y)
         }

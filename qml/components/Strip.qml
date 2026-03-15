@@ -8,6 +8,8 @@ Rectangle {
 
     required property int stripIndex
     required property var stripData
+    required property var meterData
+    required property var appMeterData
     required property var controller
     required property var busLabels
 
@@ -15,7 +17,7 @@ Rectangle {
     readonly property color edgeColor: "#343434"
     readonly property color textColor: "#ece7e2"
     readonly property color mutedTextColor: "#a49d95"
-    readonly property color meterColor: "#cfe7e4"
+    readonly property color meterColor: "#6fa67e"
     readonly property color fillColor: "#6fa67e"
     readonly property color dangerColor: "#a15a52"
     readonly property color warningColor: "#b98e52"
@@ -65,8 +67,8 @@ Rectangle {
                     anchors.right: parent.right
                     anchors.bottom: parent.bottom
                     height: 340
-                    leftLevel: root.stripData.meterLeft
-                    rightLevel: root.stripData.meterRight
+                    leftLevel: Number(root.meterData && root.meterData.left !== undefined ? root.meterData.left : 0)
+                    rightLevel: Number(root.meterData && root.meterData.right !== undefined ? root.meterData.right : 0)
                     fillColor: root.meterColor
                 }
             }
@@ -91,6 +93,7 @@ Rectangle {
                     borderColor: root.edgeColor
                     onMoved: function(nextValue) {
                         root.liveGainValue = nextValue
+                        root.controller.preview_strip_gain(root.stripIndex, nextValue)
                     }
                     onReleased: function(nextValue) {
                         root.liveGainValue = nextValue

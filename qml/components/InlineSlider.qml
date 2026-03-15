@@ -4,6 +4,7 @@ Item {
     id: root
 
     required property real value
+    property alias pressed: dragArea.pressed
     property real from: 0.0
     property real to: 1.0
     property color fillColor: "#8bc39f"
@@ -66,6 +67,7 @@ Item {
     }
 
     MouseArea {
+        id: dragArea
         anchors.fill: parent
         cursorShape: Qt.PointingHandCursor
 
@@ -73,8 +75,10 @@ Item {
             root.moved(root.valueFromX(mouseX))
         }
 
-        onPressed: applyAt(mouse.x)
-        onPositionChanged: {
+        onPressed: function(mouse) {
+            applyAt(mouse.x)
+        }
+        onPositionChanged: function(mouse) {
             if (pressed)
                 applyAt(mouse.x)
         }

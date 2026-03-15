@@ -17,8 +17,25 @@ ApplicationWindow {
     color: "#161616"
     title: "VoiceWire"
 
+    onClosing: mixer.shutdown()
+
+    Component.onDestruction: mixer.shutdown()
+
     MixerController {
         id: mixer
+    }
+
+    SettingsPanel {
+        id: settingsPanel
+        controller: mixer
+        appRoutes: window.sessionState.appRoutes || []
+    }
+
+    Timer {
+        interval: 40
+        running: window.visible
+        repeat: true
+        onTriggered: mixer.refresh_demo_levels()
     }
 
     property var sessionState: {
@@ -26,6 +43,14 @@ ApplicationWindow {
             return JSON.parse(mixer.state_json)
         } catch (error) {
             return { strips: [], buses: [] }
+        }
+    }
+
+    property var meterState: {
+        try {
+            return JSON.parse(mixer.meter_json)
+        } catch (error) {
+            return { stripMeters: [], busMeters: [], appMeters: [] }
         }
     }
 
@@ -129,6 +154,8 @@ ApplicationWindow {
                                 height: stripsRow.height
                                 stripIndex: index
                                 stripData: modelData
+                                meterData: (window.meterState.stripMeters || [])[index] || { left: 0, right: 0 }
+                                appMeterData: (window.meterState.appMeters || [])[index] || []
                                 controller: mixer
                                 busLabels: window.busLabels
                             }
@@ -155,10 +182,7 @@ ApplicationWindow {
 
                     RowLayout {
                         Layout.fillWidth: true
-
-                        Item {
-                            Layout.fillWidth: true
-                        }
+                        spacing: 0
 
                         Label {
                             text: "Master Section"
@@ -167,10 +191,44 @@ ApplicationWindow {
                             font.family: "Noto Sans"
                             font.pixelSize: 16
                             font.weight: Font.DemiBold
+                            Layout.alignment: Qt.AlignVCenter
                         }
 
                         Item {
                             Layout.fillWidth: true
+                        }
+
+                        ToolButton {
+                            id: settingsButton
+
+                            Layout.preferredWidth: 28
+                            Layout.preferredHeight: 28
+                            padding: 0
+                            hoverEnabled: true
+                            onClicked: {
+                                mixer.refresh_app_routes()
+                                settingsPanel.open()
+                            }
+
+                            background: Rectangle {
+                                radius: 4
+                                color: settingsButton.down ? "#1c1c1c" : (settingsButton.hovered ? "#1a1a1a" : "transparent")
+                                border.color: settingsButton.hovered ? palette.panelEdge : "transparent"
+                            }
+
+                            contentItem: Item {
+                                Image {
+                                    anchors.centerIn: parent
+                                    width: 18
+                                    height: 18
+                                    source: "qrc:/qt/qml/VoiceWire/qml/assets/settings-configure-symbolic.svg"
+                                    fillMode: Image.PreserveAspectFit
+                                    smooth: true
+                                }
+                            }
+
+                            ToolTip.visible: hovered
+                            ToolTip.text: "Settings"
                         }
                     }
 
@@ -234,6 +292,7 @@ ApplicationWindow {
                                     height: busViewport.height
                                     busIndex: index
                                     busData: modelData
+                                    meterData: (window.meterState.busMeters || [])[index] || { left: 0, right: 0 }
                                     controller: mixer
                                 }
                             }

@@ -8,13 +8,14 @@ Rectangle {
 
     required property int busIndex
     required property var busData
+    required property var meterData
     required property var controller
 
     readonly property color surfaceColor: "#252525"
     readonly property color edgeColor: "#343434"
     readonly property color textColor: "#ece7e2"
     readonly property color mutedTextColor: "#a49d95"
-    readonly property color meterColor: "#d6e7de"
+    readonly property color meterColor: "#6fa67e"
     readonly property color fillColor: "#6fa67e"
     readonly property color dangerColor: "#a15a52"
     readonly property bool isHardwareBus: root.busIndex < 3
@@ -32,8 +33,8 @@ Rectangle {
 
     ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 6
-        spacing: 5
+        anchors.margins: 5
+        spacing: 4
 
         ColumnLayout {
             Layout.fillWidth: true
@@ -78,8 +79,8 @@ Rectangle {
                     anchors.right: parent.right
                     anchors.bottom: parent.bottom
                     height: parent.height
-                    leftLevel: root.busData.meterLeft
-                    rightLevel: root.busData.meterRight
+                    leftLevel: Number(root.meterData && root.meterData.left !== undefined ? root.meterData.left : 0)
+                    rightLevel: Number(root.meterData && root.meterData.right !== undefined ? root.meterData.right : 0)
                     fillColor: root.meterColor
                 }
             }
@@ -104,6 +105,7 @@ Rectangle {
                     borderColor: root.edgeColor
                     onMoved: function(nextValue) {
                         root.liveGainValue = nextValue
+                        root.controller.preview_bus_gain(root.busIndex, nextValue)
                     }
                     onReleased: function(nextValue) {
                         root.liveGainValue = nextValue

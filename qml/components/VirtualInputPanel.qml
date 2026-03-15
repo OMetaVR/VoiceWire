@@ -13,7 +13,10 @@ Item {
     property bool expandedApps: false
     readonly property int compactCount: 3
     readonly property bool canExpand: (root.stripData.apps || []).length > root.compactCount
-    readonly property int visibleCount: root.expandedApps ? (root.stripData.apps || []).length : Math.min(root.compactCount, (root.stripData.apps || []).length)
+    readonly property var visibleApps: {
+        const apps = root.stripData.apps || []
+        return root.expandedApps ? apps : apps.slice(0, root.compactCount)
+    }
 
     property real panX: 0.5
     property real panY: 0.5
@@ -202,7 +205,7 @@ Item {
 
             Layout.fillWidth: true
             Layout.fillHeight: true
-            Layout.topMargin: 22
+            Layout.topMargin: 14
             color: "transparent"
             border.color: "transparent"
             clip: true
@@ -221,13 +224,15 @@ Item {
                     spacing: 4
 
                     Repeater {
-                        model: root.visibleCount
+                        model: root.visibleApps || []
 
                         AppVolumeRow {
+                            required property var modelData
+
                             width: appColumn.width
                             stripIndex: root.stripIndex
                             appIndex: index
-                            appData: root.stripData.apps[index]
+                            appData: modelData
                             controller: root.controller
                         }
                     }

@@ -1,4 +1,8 @@
+mod backend;
+mod controller;
+mod model;
 mod mixer_controller;
+mod persistence;
 
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
 

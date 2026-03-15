@@ -7,22 +7,30 @@ Rectangle {
 
     required property var options
     required property string currentValue
+    property string placeholderText: "Select Device"
     signal picked(string value)
     property bool hovered: false
-    property real popupWidth: {
-        let widest = Math.max(220, metrics.advanceWidth + 28)
-        const list = root.options || []
-        for (let i = 0; i < list.length; i += 1) {
-            metrics.text = list[i].name
-            widest = Math.max(widest, metrics.advanceWidth + 28)
-        }
-        return widest
-    }
+    readonly property string displayValue: root.currentValue.length > 0 ? root.currentValue : root.placeholderText
+    property real popupWidth: 220
 
     implicitHeight: 28
     radius: 4
     color: "#1d1d1d"
     border.color: "#353535"
+
+    function recomputePopupWidth() {
+        let widest = Math.max(220, metrics.tightBoundingRect.width + 28)
+        const list = root.options || []
+        for (let i = 0; i < list.length; i += 1) {
+            metrics.text = list[i].name
+            widest = Math.max(widest, metrics.tightBoundingRect.width + 28)
+        }
+        root.popupWidth = widest
+    }
+
+    Component.onCompleted: recomputePopupWidth()
+    onOptionsChanged: recomputePopupWidth()
+    onCurrentValueChanged: recomputePopupWidth()
 
     RowLayout {
         anchors.fill: parent
@@ -32,8 +40,8 @@ Rectangle {
 
         Label {
             Layout.fillWidth: true
-            text: root.currentValue
-            color: "#ece7e2"
+            text: root.displayValue
+            color: root.currentValue.length > 0 ? "#ece7e2" : "#9d978f"
             font.family: "Noto Sans"
             font.pixelSize: 10
             clip: true
@@ -55,12 +63,13 @@ Rectangle {
         onHoveredChanged: root.hovered = hovered
     }
 
-    ToolTip.visible: root.hovered
+    ToolTip.visible: root.hovered && root.currentValue.length > 0
     ToolTip.text: root.currentValue
     ToolTip.delay: 300
 
     TextMetrics {
         id: metrics
+        text: root.displayValue
         font.family: "Noto Sans"
         font.pixelSize: 11
     }

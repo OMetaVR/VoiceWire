@@ -5,12 +5,14 @@ Rectangle {
 
     required property real leftLevel
     required property real rightLevel
-    property color fillColor: "#c7e9e9"
+    property color fillColor: "#6fa67e"
     property color trackColor: "#0f0f0f"
+    property color warningColor: "#b35a54"
+    property real warningThreshold: 0.78
     property real displayLeft: Math.max(0, Math.min(1, leftLevel))
     property real displayRight: Math.max(0, Math.min(1, rightLevel))
-    property bool animated: true
-    property real phase: 0
+    readonly property real contentHeight: Math.max(0, height - 2)
+    readonly property real warningHeight: contentHeight * warningThreshold
 
     implicitWidth: 20
     implicitHeight: 320
@@ -33,8 +35,32 @@ Rectangle {
         anchors.leftMargin: 1
         anchors.bottom: parent.bottom
         width: Math.floor((parent.width - 3) / 2)
-        height: Math.max(2, (parent.height - 2) * root.displayLeft)
+        height: Math.max(0, Math.min(root.warningHeight, root.contentHeight * root.displayLeft))
         color: root.fillColor
+
+        Behavior on height {
+            NumberAnimation {
+                duration: 45
+                easing.type: Easing.OutCubic
+            }
+        }
+    }
+
+    Rectangle {
+        anchors.left: parent.left
+        anchors.leftMargin: 1
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: Math.min(root.warningHeight, root.contentHeight * root.displayLeft)
+        width: Math.floor((parent.width - 3) / 2)
+        height: Math.max(0, root.contentHeight * root.displayLeft - root.warningHeight)
+        color: root.warningColor
+
+        Behavior on height {
+            NumberAnimation {
+                duration: 45
+                easing.type: Easing.OutCubic
+            }
+        }
     }
 
     Rectangle {
@@ -42,8 +68,32 @@ Rectangle {
         anchors.rightMargin: 1
         anchors.bottom: parent.bottom
         width: Math.floor((parent.width - 3) / 2)
-        height: Math.max(2, (parent.height - 2) * root.displayRight)
+        height: Math.max(0, Math.min(root.warningHeight, root.contentHeight * root.displayRight))
         color: root.fillColor
+
+        Behavior on height {
+            NumberAnimation {
+                duration: 45
+                easing.type: Easing.OutCubic
+            }
+        }
+    }
+
+    Rectangle {
+        anchors.right: parent.right
+        anchors.rightMargin: 1
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: Math.min(root.warningHeight, root.contentHeight * root.displayRight)
+        width: Math.floor((parent.width - 3) / 2)
+        height: Math.max(0, root.contentHeight * root.displayRight - root.warningHeight)
+        color: root.warningColor
+
+        Behavior on height {
+            NumberAnimation {
+                duration: 45
+                easing.type: Easing.OutCubic
+            }
+        }
     }
 
     Repeater {
@@ -59,26 +109,7 @@ Rectangle {
         }
     }
 
-    Timer {
-        interval: 80
-        repeat: true
-        running: root.animated
-        onTriggered: {
-            root.phase += 0.33
-            const wobbleA = 0.9 + Math.sin(root.phase) * 0.08
-            const wobbleB = 0.9 + Math.sin(root.phase + 0.55) * 0.08
-            root.displayLeft = Math.max(0, Math.min(1, root.leftLevel * wobbleA))
-            root.displayRight = Math.max(0, Math.min(1, root.rightLevel * wobbleB))
-        }
-    }
+    onLeftLevelChanged: root.displayLeft = Math.max(0, Math.min(1, root.leftLevel))
 
-    onLeftLevelChanged: {
-        if (!animated)
-            root.displayLeft = Math.max(0, Math.min(1, root.leftLevel))
-    }
-
-    onRightLevelChanged: {
-        if (!animated)
-            root.displayRight = Math.max(0, Math.min(1, root.rightLevel))
-    }
+    onRightLevelChanged: root.displayRight = Math.max(0, Math.min(1, root.rightLevel))
 }
