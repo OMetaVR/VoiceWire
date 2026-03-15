@@ -29,6 +29,10 @@ ApplicationWindow {
         id: settingsPanel
         controller: mixer
         appRoutes: window.sessionState.appRoutes || []
+        quickRouteEnabled: window.quickRouteEnabled
+        onQuickRouteToggled: function(enabled) {
+            mixer.set_quick_route_enabled(enabled)
+        }
     }
 
     Timer {
@@ -36,6 +40,20 @@ ApplicationWindow {
         running: window.visible
         repeat: true
         onTriggered: mixer.refresh_demo_levels()
+    }
+
+    Timer {
+        interval: 600
+        running: window.visible
+        repeat: false
+        onTriggered: mixer.refresh_app_routes()
+    }
+
+    Timer {
+        interval: 1500
+        running: window.visible && !quickRouteTracker.active
+        repeat: true
+        onTriggered: mixer.refresh_app_routes()
     }
 
     property var sessionState: {
@@ -53,6 +71,7 @@ ApplicationWindow {
             return { stripMeters: [], busMeters: [], appMeters: [] }
         }
     }
+    readonly property bool quickRouteEnabled: Boolean(window.sessionState.quickRouteEnabled)
 
     readonly property var busLabels: ["A1", "A2", "A3", "B1", "B2", "B3"]
     readonly property int laneGap: 6
@@ -70,6 +89,112 @@ ApplicationWindow {
         readonly property color warning: "#b98e52"
         readonly property color danger: "#a15a52"
         readonly property color meterTrack: "#101010"
+    }
+
+    QtObject {
+        id: quickRouteTracker
+
+        property bool active: false
+        property real dragX: 0
+        property real dragY: 0
+        property int appId: -1
+        property string sourceTarget: ""
+        property string hoveredTarget: ""
+        property string iconText: "--"
+        property string iconColor: "#444444"
+        property string displayText: ""
+        property var targets: ({})
+
+        function beginDrag(appId, sourceTarget, iconText, iconColor, displayText, x, y) {
+            active = true
+            dragX = x
+            dragY = y
+            hoveredTarget = ""
+            quickRouteTracker.appId = appId
+            quickRouteTracker.sourceTarget = sourceTarget
+            quickRouteTracker.iconText = iconText
+            quickRouteTracker.iconColor = iconColor
+            quickRouteTracker.displayText = displayText
+            refreshHoveredTarget()
+        }
+
+        function updateDrag(x, y) {
+            dragX = x
+            dragY = y
+            refreshHoveredTarget()
+        }
+
+        function setHoveredTarget(target) {
+            hoveredTarget = target
+        }
+
+        function registerTarget(target, item) {
+            if (!target || !item)
+                return
+
+            const next = Object.assign({}, targets)
+            next[target] = { item: item }
+            targets = next
+            refreshHoveredTarget()
+        }
+
+        function unregisterTarget(target) {
+            if (!targets[target])
+                return
+
+            const next = Object.assign({}, targets)
+            delete next[target]
+            targets = next
+            refreshHoveredTarget()
+        }
+
+        function refreshHoveredTarget() {
+            if (!active) {
+                hoveredTarget = ""
+                return
+            }
+
+            let nextTarget = ""
+            for (const key in targets) {
+                const rect = targets[key]
+                if (!rect || !rect.item || key === sourceTarget)
+                    continue
+
+                const topLeft = rect.item.mapToItem(null, 0, 0)
+                const width = rect.item.width
+                const height = rect.item.height
+                if (width <= 0 || height <= 0)
+                    continue
+
+                if (dragX >= topLeft.x && dragX <= topLeft.x + width
+                    && dragY >= topLeft.y && dragY <= topLeft.y + height) {
+                    nextTarget = key
+                    break
+                }
+            }
+            hoveredTarget = nextTarget
+        }
+
+        function finishDrag() {
+            const nextTarget = hoveredTarget
+            const nextAppId = appId
+            const shouldRoute = active && nextAppId >= 0 && nextTarget.length > 0 && nextTarget !== sourceTarget
+            cancelDrag()
+            if (shouldRoute)
+                mixer.set_app_route(nextAppId, nextTarget)
+        }
+
+        function cancelDrag() {
+            active = false
+            dragX = 0
+            dragY = 0
+            appId = -1
+            sourceTarget = ""
+            hoveredTarget = ""
+            iconText = "--"
+            iconColor = "#444444"
+            displayText = ""
+        }
     }
 
     Rectangle {
@@ -158,6 +283,8 @@ ApplicationWindow {
                                 appMeterData: (window.meterState.appMeters || [])[index] || []
                                 controller: mixer
                                 busLabels: window.busLabels
+                                quickRouteEnabled: window.quickRouteEnabled
+                                quickRouteState: quickRouteTracker
                             }
                         }
                     }
@@ -227,8 +354,6 @@ ApplicationWindow {
                                 }
                             }
 
-                            ToolTip.visible: hovered
-                            ToolTip.text: "Settings"
                         }
                     }
 
@@ -301,5 +426,55 @@ ApplicationWindow {
                 }
             }
         }
+
+        Rectangle {
+            visible: quickRouteTracker.active
+            x: quickRouteTracker.dragX + 12
+            y: quickRouteTracker.dragY + 12
+            z: 100
+            width: Math.min(196, previewLabel.implicitWidth + 30)
+            height: 24
+            radius: 4
+            color: "#202020"
+            border.color: "#3a3a3a"
+            clip: true
+
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 8
+                anchors.rightMargin: 8
+                spacing: 6
+
+                Rectangle {
+                    Layout.preferredWidth: 12
+                    Layout.preferredHeight: 12
+                    radius: 2
+                    color: quickRouteTracker.iconColor
+                    border.color: "#424242"
+
+                    Label {
+                        anchors.centerIn: parent
+                        text: quickRouteTracker.iconText
+                        color: "#ece7e2"
+                        font.family: "Noto Sans"
+                        font.pixelSize: 6
+                        font.weight: Font.DemiBold
+                    }
+                }
+
+                Label {
+                    id: previewLabel
+
+                    Layout.fillWidth: true
+                    text: quickRouteTracker.displayText
+                    color: "#ece7e2"
+                    font.family: "Noto Sans"
+                    font.pixelSize: 9
+                    elide: Text.ElideRight
+                    verticalAlignment: Text.AlignVCenter
+                }
+            }
+        }
+
     }
 }

@@ -3,14 +3,14 @@ import QtQuick.Controls
 import QtQuick.Layouts
 
 Rectangle {
-    id: root
+    id: selectorRoot
 
     required property var options
     required property string currentValue
     property string placeholderText: "Select Device"
     signal picked(string value)
     property bool hovered: false
-    readonly property string displayValue: root.currentValue.length > 0 ? root.currentValue : root.placeholderText
+    readonly property string displayValue: selectorRoot.currentValue.length > 0 ? selectorRoot.currentValue : selectorRoot.placeholderText
     property real popupWidth: 220
 
     implicitHeight: 28
@@ -20,12 +20,23 @@ Rectangle {
 
     function recomputePopupWidth() {
         let widest = Math.max(220, metrics.tightBoundingRect.width + 28)
-        const list = root.options || []
+        const list = selectorRoot.options || []
         for (let i = 0; i < list.length; i += 1) {
             metrics.text = list[i].name
             widest = Math.max(widest, metrics.tightBoundingRect.width + 28)
         }
-        root.popupWidth = widest
+        selectorRoot.popupWidth = widest
+    }
+
+    function togglePopup() {
+        if (selectorPopup.opened)
+            selectorPopup.close()
+        else
+            selectorPopup.open()
+    }
+
+    function closePopup() {
+        selectorPopup.close()
     }
 
     Component.onCompleted: recomputePopupWidth()
@@ -40,8 +51,8 @@ Rectangle {
 
         Label {
             Layout.fillWidth: true
-            text: root.displayValue
-            color: root.currentValue.length > 0 ? "#ece7e2" : "#9d978f"
+            text: selectorRoot.displayValue
+            color: selectorRoot.currentValue.length > 0 ? "#ece7e2" : "#9d978f"
             font.family: "Noto Sans"
             font.pixelSize: 10
             clip: true
@@ -51,34 +62,25 @@ Rectangle {
     }
 
     TapHandler {
-        onTapped: {
-            if (popup.opened)
-                popup.close()
-            else
-                popup.open()
-        }
+        onTapped: selectorRoot.togglePopup()
     }
 
     HoverHandler {
-        onHoveredChanged: root.hovered = hovered
+        onHoveredChanged: selectorRoot.hovered = hovered
     }
-
-    ToolTip.visible: root.hovered && root.currentValue.length > 0
-    ToolTip.text: root.currentValue
-    ToolTip.delay: 300
 
     TextMetrics {
         id: metrics
-        text: root.displayValue
+        text: selectorRoot.displayValue
         font.family: "Noto Sans"
         font.pixelSize: 11
     }
 
     Popup {
-        id: popup
+        id: selectorPopup
 
-        y: root.height + 4
-        width: root.popupWidth
+        y: selectorRoot.height + 4
+        width: selectorRoot.popupWidth
         padding: 4
         modal: false
         focus: true
@@ -93,16 +95,16 @@ Rectangle {
             spacing: 4
 
             Repeater {
-                model: root.options || []
+                model: selectorRoot.options || []
 
                 Rectangle {
                     required property var modelData
 
-                    width: popup.availableWidth
+                    width: selectorPopup.availableWidth
                     height: 30
                     radius: 3
-                    color: modelData.name === root.currentValue ? "#2a2a2a" : "#202020"
-                    border.color: modelData.name === root.currentValue ? "#7a9b86" : "#353535"
+                    color: modelData.name === selectorRoot.currentValue ? "#2a2a2a" : "#202020"
+                    border.color: modelData.name === selectorRoot.currentValue ? "#7a9b86" : "#353535"
 
                     Label {
                         anchors.verticalCenter: parent.verticalCenter
@@ -120,8 +122,8 @@ Rectangle {
 
                     TapHandler {
                         onTapped: {
-                            root.picked(modelData.name)
-                            popup.close()
+                            selectorRoot.picked(modelData.name)
+                            selectorRoot.closePopup()
                         }
                     }
                 }

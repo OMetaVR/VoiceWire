@@ -1,7 +1,8 @@
 use cxx_qt_build::{CxxQtBuilder, QmlModule};
 
 fn main() {
-    CxxQtBuilder::new_qml_module(
+    unsafe {
+        CxxQtBuilder::new_qml_module(
         QmlModule::new("VoiceWire").qml_files([
             "qml/components/AppVolumeRow.qml",
             "qml/components/AppRoutingRow.qml",
@@ -25,5 +26,10 @@ fn main() {
     .qt_module("Quick")
     .qt_module("QuickControls2")
     .file("src/mixer_controller.rs")
+    .cc_builder(|cc| {
+        cc.flag_if_supported("-Wno-unused-parameter");
+        cc.flag_if_supported("/wd4100");
+    })
     .build();
+    }
 }

@@ -21,6 +21,11 @@ impl AppController {
         &self.session
     }
 
+    pub fn set_quick_route_enabled(&mut self, enabled: bool) {
+        self.session.set_quick_route_enabled(enabled);
+        persistence::save_session_async(self.session.clone());
+    }
+
     pub fn dispatch(&mut self, command: BackendCommand) {
         let should_persist = should_persist_command(&command);
         let events = self.backend.handle(&self.session, command);
@@ -100,7 +105,9 @@ impl AppController {
                     .set_virtual_app_muted(strip_index, app_index, muted);
             }
             BackendEvent::AppRoutesUpdated { routes } => {
-                self.session.set_app_routes(routes);
+                if self.session.set_app_routes(routes) {
+                    persistence::save_session_async(self.session.clone());
+                }
             }
             BackendEvent::MetersUpdated { snapshot } => {
                 self.session.set_meters(&snapshot);
@@ -124,9 +131,6 @@ fn should_persist_command(command: &BackendCommand) -> bool {
         BackendCommand::Start
             | BackendCommand::RefreshMeters
             | BackendCommand::RefreshAppRoutes
-            | BackendCommand::SetAppRoute { .. }
-            | BackendCommand::SetAppLevel { .. }
-            | BackendCommand::ToggleAppMuted { .. }
             | BackendCommand::SetVirtualAppLevel { .. }
             | BackendCommand::ToggleVirtualAppMuted { .. }
             | BackendCommand::PreviewStripGain { .. }

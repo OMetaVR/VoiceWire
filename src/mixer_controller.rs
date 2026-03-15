@@ -92,6 +92,9 @@ mod qobject {
         fn refresh_app_routes(self: Pin<&mut MixerController>);
 
         #[qinvokable]
+        fn set_quick_route_enabled(self: Pin<&mut MixerController>, enabled: bool);
+
+        #[qinvokable]
         fn set_app_route(self: Pin<&mut MixerController>, app_id: i32, target: &QString);
 
         #[qinvokable]
@@ -334,6 +337,17 @@ impl qobject::MixerController {
 
     fn refresh_app_routes(self: core::pin::Pin<&mut Self>) {
         self.dispatch_command(BackendCommand::RefreshAppRoutes);
+    }
+
+    fn set_quick_route_enabled(mut self: core::pin::Pin<&mut Self>, enabled: bool) {
+        {
+            let mut rust = self.as_mut().rust_mut();
+            rust.as_mut()
+                .get_mut()
+                .app
+                .set_quick_route_enabled(enabled);
+        }
+        self.as_mut().sync_state_json();
     }
 
     fn set_app_route(self: core::pin::Pin<&mut Self>, app_id: i32, target: &QString) {

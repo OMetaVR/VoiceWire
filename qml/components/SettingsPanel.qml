@@ -8,6 +8,8 @@ Popup {
 
     required property var controller
     required property var appRoutes
+    required property bool quickRouteEnabled
+    signal quickRouteToggled(bool enabled)
 
     parent: Overlay.overlay
     anchors.centerIn: parent
@@ -139,6 +141,71 @@ Popup {
                     Layout.fillWidth: true
                     Layout.preferredHeight: 1
                     color: "#2b2b2b"
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 58
+                    color: "#191919"
+                    border.color: "#2d2d2d"
+                    radius: 4
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 14
+                        anchors.rightMargin: 14
+                        spacing: 16
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 2
+
+                            Label {
+                                Layout.fillWidth: true
+                                text: "Quick App Routing"
+                                color: "#ece7e2"
+                                font.family: "Noto Sans"
+                                font.pixelSize: 12
+                                font.weight: Font.DemiBold
+                                elide: Text.ElideRight
+                            }
+
+                            Label {
+                                Layout.fillWidth: true
+                                text: "Drag an app name or icon between VAIO, AUX, and SYS on the main mixer."
+                                color: "#a49d95"
+                                font.family: "Noto Sans"
+                                font.pixelSize: 10
+                                wrapMode: Text.WordWrap
+                            }
+                        }
+
+                        AbstractButton {
+                            id: quickRouteToggle
+
+                            Layout.alignment: Qt.AlignVCenter
+                            implicitWidth: 40
+                            implicitHeight: 22
+                            hoverEnabled: true
+                            onClicked: root.quickRouteToggled(!root.quickRouteEnabled)
+
+                            background: Rectangle {
+                                radius: height / 2
+                                color: root.quickRouteEnabled ? "#7a9b86" : "#111111"
+                                border.color: root.quickRouteEnabled ? "#90b59c" : (quickRouteToggle.hovered ? "#454545" : "#343434")
+
+                                Rectangle {
+                                    width: 16
+                                    height: 16
+                                    radius: 8
+                                    x: root.quickRouteEnabled ? parent.width - width - 2 : 2
+                                    y: 2
+                                    color: root.quickRouteEnabled ? "#171717" : "#f0ece7"
+                                    border.color: root.quickRouteEnabled ? "#101010" : "#d7d1cb"
+                                }
+                            }
+                        }
+                    }
                 }
 
                 ScrollView {

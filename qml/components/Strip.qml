@@ -12,6 +12,8 @@ Rectangle {
     required property var appMeterData
     required property var controller
     required property var busLabels
+    required property bool quickRouteEnabled
+    property var quickRouteState: null
 
     readonly property color surfaceColor: "#252525"
     readonly property color edgeColor: "#343434"
@@ -22,6 +24,16 @@ Rectangle {
     readonly property color dangerColor: "#a15a52"
     readonly property color warningColor: "#b98e52"
     readonly property bool isVirtual: root.stripData.endpointKind === "virtualInput"
+    readonly property string routeTargetLabel: {
+        const headerName = String(root.stripData && root.stripData.headerName ? root.stripData.headerName : "")
+        if (headerName.indexOf("VAIO") !== -1)
+            return "VAIO"
+        if (headerName.indexOf("AUX") !== -1)
+            return "AUX"
+        if (headerName.indexOf("SYS") !== -1)
+            return "SYS"
+        return ""
+    }
     property real liveGainValue: Number(root.stripData && root.stripData.gainDb !== undefined ? root.stripData.gainDb : 0)
 
     color: root.surfaceColor
@@ -290,6 +302,9 @@ Rectangle {
             stripIndex: root.stripIndex
             stripData: root.stripData
             controller: root.controller
+            quickRouteEnabled: root.quickRouteEnabled
+            quickRouteState: root.quickRouteState
+            routeTargetLabel: root.routeTargetLabel
         }
     }
 }

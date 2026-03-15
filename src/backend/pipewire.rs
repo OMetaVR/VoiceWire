@@ -204,7 +204,7 @@ impl AudioBackend for PipeWireDiscoveryBackend {
                 events.extend(self.ensure_session_bus_bindings(session));
                 self.sync_all_runtime_mix_state(session);
                 events.extend(self.sync_all_routes(session));
-                events.extend(self.refresh_app_routes());
+                events.extend(self.refresh_app_routes(session));
                 events.push(self.next_meter_event(session));
             }
             BackendCommand::Shutdown => {
@@ -233,7 +233,7 @@ impl AudioBackend for PipeWireDiscoveryBackend {
                 events.push(self.next_meter_event(session));
             }
             BackendCommand::RefreshAppRoutes => {
-                events.extend(self.refresh_app_routes());
+                events.extend(self.refresh_app_routes(session));
             }
             BackendCommand::ToggleRoute {
                 strip_index,
@@ -420,13 +420,25 @@ impl AudioBackend for PipeWireDiscoveryBackend {
                 if let Err(message) = move_sink_input_to_target(app_id, target.as_str()) {
                     events.push(BackendEvent::BackendError { message });
                 }
-                events.extend(self.refresh_app_routes());
+                let mut temp = session.clone();
+                let mut routes = temp.app_routes.clone();
+                if let Some(route) = routes.iter_mut().find(|route| route.id == app_id) {
+                    route.target = target.clone();
+                    temp.set_app_routes(routes);
+                }
+                events.extend(self.refresh_app_routes(&temp));
             }
             BackendCommand::SetAppLevel { app_id, level } => {
                 if let Err(message) = set_sink_input_volume(app_id, level.clamp(0.0, 1.0)) {
                     events.push(BackendEvent::BackendError { message });
                 }
-                events.extend(self.refresh_app_routes());
+                let mut temp = session.clone();
+                let mut routes = temp.app_routes.clone();
+                if let Some(route) = routes.iter_mut().find(|route| route.id == app_id) {
+                    route.level = level.clamp(0.0, 1.0);
+                    temp.set_app_routes(routes);
+                }
+                events.extend(self.refresh_app_routes(&temp));
             }
             BackendCommand::ToggleAppMuted { app_id } => {
                 match find_sink_input_muted(app_id) {
@@ -437,7 +449,13 @@ impl AudioBackend for PipeWireDiscoveryBackend {
                     }
                     Err(message) => events.push(BackendEvent::BackendError { message }),
                 }
-                events.extend(self.refresh_app_routes());
+                let mut temp = session.clone();
+                let mut routes = temp.app_routes.clone();
+                if let Some(route) = routes.iter_mut().find(|route| route.id == app_id) {
+                    route.muted = !route.muted;
+                    temp.set_app_routes(routes);
+                }
+                events.extend(self.refresh_app_routes(&temp));
             }
         }
 
@@ -1192,11 +1210,48 @@ impl PipeWireDiscoveryBackend {
         }
     }
 
-    fn refresh_app_routes(&self) -> Vec<BackendEvent> {
-        match list_app_routes() {
-            Ok(routes) => vec![BackendEvent::AppRoutesUpdated { routes }],
-            Err(message) => vec![BackendEvent::BackendError { message }],
+    fn refresh_app_routes(&self, session: &SessionState) -> Vec<BackendEvent> {
+        let mut routes = match list_app_routes() {
+            Ok(routes) => routes,
+            Err(message) => return vec![BackendEvent::BackendError { message }],
+        };
+
+        let mut reapplied_settings = false;
+        for route in &routes {
+            let Some(saved) = session.remembered_app_route_for(route) else {
+                continue;
+            };
+
+            if !saved.target.is_empty() && saved.target != route.target {
+                if let Err(message) = move_sink_input_to_target(route.id, saved.target.as_str()) {
+                    return vec![BackendEvent::BackendError { message }];
+                }
+                reapplied_settings = true;
+            }
+
+            if (saved.level - route.level).abs() > 0.01 {
+                if let Err(message) = set_sink_input_volume(route.id, saved.level) {
+                    return vec![BackendEvent::BackendError { message }];
+                }
+                reapplied_settings = true;
+            }
+
+            if saved.muted != route.muted {
+                if let Err(message) = set_sink_input_mute(route.id, saved.muted) {
+                    return vec![BackendEvent::BackendError { message }];
+                }
+                reapplied_settings = true;
+            }
         }
+
+        if reapplied_settings {
+            routes = match list_app_routes() {
+                Ok(routes) => routes,
+                Err(message) => return vec![BackendEvent::BackendError { message }],
+            };
+        }
+
+        vec![BackendEvent::AppRoutesUpdated { routes }]
     }
 }
 

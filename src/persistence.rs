@@ -10,6 +10,10 @@ use crate::model::SessionState;
 struct PersistedSession {
     strips: Vec<PersistedStrip>,
     buses: Vec<PersistedBus>,
+    #[serde(default, alias = "appRoutes", alias = "app_routes")]
+    remembered_app_routes: Vec<PersistedAppRoute>,
+    #[serde(default)]
+    quick_route_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -36,6 +40,18 @@ struct PersistedApp {
 struct PersistedBus {
     destination_name: String,
     gain_db: f32,
+    muted: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedAppRoute {
+    name: String,
+    detail: String,
+    target: String,
+    icon_text: String,
+    icon_color: String,
+    level: f32,
     muted: bool,
 }
 
@@ -73,6 +89,8 @@ fn save_session_inner(persisted: PersistedSession) {
 }
 
 fn apply_persisted_session(session: &mut SessionState, persisted: PersistedSession) {
+    session.set_quick_route_enabled(persisted.quick_route_enabled);
+
     for (strip, saved) in session.strips.iter_mut().zip(persisted.strips) {
         strip.device_name = saved.device_name;
         strip.gain_db = saved.gain_db.clamp(-60.0, 12.0);
@@ -94,6 +112,24 @@ fn apply_persisted_session(session: &mut SessionState, persisted: PersistedSessi
         bus.destination_name = saved.destination_name;
         bus.gain_db = saved.gain_db.clamp(-60.0, 12.0);
         bus.muted = saved.muted;
+    }
+
+    if !persisted.remembered_app_routes.is_empty() {
+        session.set_remembered_app_routes(
+            persisted
+                .remembered_app_routes
+                .into_iter()
+                .map(|route| crate::model::RememberedAppRouteState {
+                    name: route.name,
+                    detail: route.detail,
+                    target: route.target,
+                    icon_text: route.icon_text,
+                    icon_color: route.icon_color,
+                    level: route.level.clamp(0.0, 1.0),
+                    muted: route.muted,
+                })
+                .collect(),
+        );
     }
 }
 
@@ -143,6 +179,20 @@ impl From<&SessionState> for PersistedSession {
                     muted: bus.muted,
                 })
                 .collect(),
+            remembered_app_routes: session
+                .remembered_app_routes
+                .iter()
+                .map(|route| PersistedAppRoute {
+                    name: route.name.clone(),
+                    detail: route.detail.clone(),
+                    target: route.target.clone(),
+                    icon_text: route.icon_text.clone(),
+                    icon_color: route.icon_color.clone(),
+                    level: route.level,
+                    muted: route.muted,
+                })
+                .collect(),
+            quick_route_enabled: session.quick_route_enabled,
         }
     }
 }

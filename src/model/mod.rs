@@ -26,7 +26,7 @@ pub struct RouteState {
     pub enabled: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppFeedState {
     pub id: u32,
@@ -39,10 +39,22 @@ pub struct AppFeedState {
     pub muted: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppRouteState {
     pub id: u32,
+    pub name: String,
+    pub detail: String,
+    pub target: String,
+    pub icon_text: String,
+    pub icon_color: String,
+    pub level: f32,
+    pub muted: bool,
+}
+
+#[derive(Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RememberedAppRouteState {
     pub name: String,
     pub detail: String,
     pub target: String,
@@ -92,6 +104,9 @@ pub struct SessionState {
     pub strips: Vec<StripState>,
     pub buses: Vec<BusState>,
     pub app_routes: Vec<AppRouteState>,
+    #[serde(skip_serializing)]
+    pub remembered_app_routes: Vec<RememberedAppRouteState>,
+    pub quick_route_enabled: bool,
     pub backend_connected: bool,
     pub virtual_endpoints_ready: bool,
     pub last_backend_error: Option<String>,
@@ -340,41 +355,56 @@ impl SessionState {
             })
             .collect();
 
+        let app_routes = vec![
+            AppRouteState {
+                id: 1,
+                name: "Spotify".into(),
+                detail: "spotify".into(),
+                target: "VAIO".into(),
+                icon_text: "SP".into(),
+                icon_color: "#335c44".into(),
+                level: 1.0,
+                muted: false,
+            },
+            AppRouteState {
+                id: 2,
+                name: "Discord".into(),
+                detail: "WEBRTC VoiceEngine".into(),
+                target: "AUX".into(),
+                icon_text: "DC".into(),
+                icon_color: "#42466a".into(),
+                level: 1.0,
+                muted: false,
+            },
+            AppRouteState {
+                id: 3,
+                name: "Zen".into(),
+                detail: "YouTube".into(),
+                target: "SYS".into(),
+                icon_text: "ZE".into(),
+                icon_color: "#584136".into(),
+                level: 1.0,
+                muted: false,
+            },
+        ];
+
         Self {
             strips,
             buses,
-            app_routes: vec![
-                AppRouteState {
-                    id: 1,
-                    name: "Spotify".into(),
-                    detail: "spotify".into(),
-                    target: "VAIO".into(),
-                    icon_text: "SP".into(),
-                    icon_color: "#335c44".into(),
-                    level: 1.0,
-                    muted: false,
-                },
-                AppRouteState {
-                    id: 2,
-                    name: "Discord".into(),
-                    detail: "WEBRTC VoiceEngine".into(),
-                    target: "AUX".into(),
-                    icon_text: "DC".into(),
-                    icon_color: "#42466a".into(),
-                    level: 1.0,
-                    muted: false,
-                },
-                AppRouteState {
-                    id: 3,
-                    name: "Zen".into(),
-                    detail: "YouTube".into(),
-                    target: "SYS".into(),
-                    icon_text: "ZE".into(),
-                    icon_color: "#584136".into(),
-                    level: 1.0,
-                    muted: false,
-                },
-            ],
+            remembered_app_routes: app_routes
+                .iter()
+                .map(|route| RememberedAppRouteState {
+                    name: route.name.clone(),
+                    detail: route.detail.clone(),
+                    target: route.target.clone(),
+                    icon_text: route.icon_text.clone(),
+                    icon_color: route.icon_color.clone(),
+                    level: route.level,
+                    muted: route.muted,
+                })
+                .collect(),
+            app_routes,
+            quick_route_enabled: false,
             backend_connected: false,
             virtual_endpoints_ready: false,
             last_backend_error: None,
@@ -499,7 +529,7 @@ impl SessionState {
         }
     }
 
-    pub fn set_app_routes(&mut self, routes: Vec<AppRouteState>) {
+    pub fn set_app_routes(&mut self, routes: Vec<AppRouteState>) -> bool {
         let previous_routes = self.app_routes.clone();
         let mut normalized_routes = routes;
         for route in &mut normalized_routes {
@@ -517,6 +547,11 @@ impl SessionState {
                     route.icon_color = previous.icon_color.clone();
                 }
             }
+        }
+
+        let remembered_changed = self.remember_app_routes(&normalized_routes);
+        if self.app_routes == normalized_routes {
+            return remembered_changed;
         }
 
         self.app_routes = normalized_routes.clone();
@@ -553,6 +588,58 @@ impl SessionState {
                 muted: route.muted,
             });
         }
+
+        true
+    }
+
+    pub fn set_remembered_app_routes(&mut self, routes: Vec<RememberedAppRouteState>) {
+        self.remembered_app_routes = routes;
+    }
+
+    pub fn remembered_app_route_for(
+        &self,
+        route: &AppRouteState,
+    ) -> Option<&RememberedAppRouteState> {
+        self.remembered_app_routes.iter().find(|candidate| {
+            app_route_identity_key(&candidate.name, &candidate.detail)
+                == app_route_identity_key(&route.name, &route.detail)
+        })
+    }
+
+    pub fn set_quick_route_enabled(&mut self, enabled: bool) {
+        self.quick_route_enabled = enabled;
+    }
+
+    fn remember_app_routes(&mut self, routes: &[AppRouteState]) -> bool {
+        let mut changed = false;
+
+        for route in routes {
+            let next = RememberedAppRouteState {
+                name: route.name.clone(),
+                detail: route.detail.clone(),
+                target: route.target.clone(),
+                icon_text: route.icon_text.clone(),
+                icon_color: route.icon_color.clone(),
+                level: route.level,
+                muted: route.muted,
+            };
+
+            let Some(existing) = self.remembered_app_routes.iter_mut().find(|candidate| {
+                app_route_identity_key(&candidate.name, &candidate.detail)
+                    == app_route_identity_key(&route.name, &route.detail)
+            }) else {
+                self.remembered_app_routes.push(next);
+                changed = true;
+                continue;
+            };
+
+            if *existing != next {
+                *existing = next;
+                changed = true;
+            }
+        }
+
+        changed
     }
 
     pub fn set_virtual_app_level(&mut self, strip_index: usize, app_index: usize, level: f32) {
@@ -728,6 +815,14 @@ impl SessionState {
                 .collect(),
         }
     }
+}
+
+fn app_route_identity_key(name: &str, detail: &str) -> String {
+    format!(
+        "{}\u{1f}{}",
+        name.trim().to_lowercase(),
+        detail.trim().to_lowercase()
+    )
 }
 
 fn demo_device(name: &str, kind: EndpointKind, stable_id: &str, device_class: &str) -> DeviceOption {

@@ -9,10 +9,22 @@ Item {
     required property int stripIndex
     required property var stripData
     required property var controller
+    required property bool quickRouteEnabled
+    property var quickRouteState: null
+    required property string routeTargetLabel
 
     property bool expandedApps: false
     readonly property int compactCount: 3
     readonly property bool canExpand: (root.stripData.apps || []).length > root.compactCount
+    readonly property bool canAcceptQuickRoute: root.quickRouteEnabled
+        && root.quickRouteState
+        && root.quickRouteState.active
+        && root.quickRouteState.appId >= 0
+        && root.quickRouteState.sourceTarget !== root.routeTargetLabel
+    readonly property bool routeDropActive: root.canAcceptQuickRoute
+        && root.quickRouteState
+        && root.quickRouteState.hoveredTarget === root.routeTargetLabel
+    readonly property bool routeDropAvailable: root.canAcceptQuickRoute
     readonly property var visibleApps: {
         const apps = root.stripData.apps || []
         return root.expandedApps ? apps : apps.slice(0, root.compactCount)
@@ -22,6 +34,21 @@ Item {
     property real panY: 0.5
 
     implicitHeight: 269
+
+    function syncQuickRouteTarget() {
+        if (!root.quickRouteState || root.routeTargetLabel.length === 0)
+            return
+
+        root.quickRouteState.registerTarget(root.routeTargetLabel, appArea)
+    }
+
+    Component.onCompleted: syncQuickRouteTarget()
+    onQuickRouteStateChanged: syncQuickRouteTarget()
+    onRouteTargetLabelChanged: syncQuickRouteTarget()
+    Component.onDestruction: {
+        if (root.quickRouteState)
+            root.quickRouteState.unregisterTarget(root.routeTargetLabel)
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -206,8 +233,9 @@ Item {
             Layout.fillWidth: true
             Layout.fillHeight: true
             Layout.topMargin: 14
-            color: "transparent"
-            border.color: "transparent"
+            color: root.routeDropActive ? "#1f2521" : "transparent"
+            border.color: root.routeDropAvailable ? (root.routeDropActive ? "#90b59c" : "#444444") : "transparent"
+            radius: 4
             clip: true
 
             Flickable {
@@ -234,9 +262,22 @@ Item {
                             appIndex: index
                             appData: modelData
                             controller: root.controller
+                            quickRouteEnabled: root.quickRouteEnabled
+                            quickRouteState: root.quickRouteState
+                            routeTargetLabel: root.routeTargetLabel
                         }
                     }
                 }
+            }
+
+            Label {
+                anchors.centerIn: parent
+                visible: root.routeDropActive
+                text: "Move to " + root.routeTargetLabel
+                color: "#ece7e2"
+                font.family: "Noto Sans"
+                font.pixelSize: 10
+                font.weight: Font.DemiBold
             }
 
             TapHandler {
