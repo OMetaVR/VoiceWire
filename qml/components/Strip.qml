@@ -35,6 +35,13 @@ Rectangle {
         return ""
     }
     property real liveGainValue: Number(root.stripData && root.stripData.gainDb !== undefined ? root.stripData.gainDb : 0)
+    property bool gainCommitPending: false
+    property real pendingGainValue: liveGainValue
+    property bool previewDirty: false
+    property real previewGainValue: liveGainValue
+    property real liveGateValue: Number(root.stripData && root.stripData.gate !== undefined ? root.stripData.gate : 0)
+    property bool gateCommitPending: false
+    property real pendingGateValue: liveGateValue
 
     color: root.surfaceColor
     radius: 4
@@ -42,8 +49,43 @@ Rectangle {
     clip: true
 
     onStripDataChanged: {
+        const modelValue = Number(root.stripData && root.stripData.gainDb !== undefined ? root.stripData.gainDb : 0)
+        if (gainCommitPending) {
+            if (Math.abs(modelValue - pendingGainValue) <= 0.01) {
+                gainCommitPending = false
+                liveGainValue = modelValue
+            }
+            return
+        }
+
         if (!gainSlider.pressed)
-            liveGainValue = Number(root.stripData && root.stripData.gainDb !== undefined ? root.stripData.gainDb : 0)
+            liveGainValue = modelValue
+
+        const gateModelValue = Number(root.stripData && root.stripData.gate !== undefined ? root.stripData.gate : 0)
+        if (gateCommitPending) {
+            if (Math.abs(gateModelValue - pendingGateValue) <= 0.01) {
+                gateCommitPending = false
+                liveGateValue = gateModelValue
+            }
+            return
+        }
+
+        liveGateValue = gateModelValue
+    }
+
+    Timer {
+        id: gainPreviewTimer
+
+        interval: 16
+        repeat: true
+        running: gainSlider.pressed
+        onTriggered: {
+            if (!root.previewDirty)
+                return
+
+            root.previewDirty = false
+            root.controller.preview_strip_gain(root.stripIndex, root.previewGainValue)
+        }
     }
 
     ColumnLayout {
@@ -99,16 +141,22 @@ Rectangle {
                     from: -60
                     to: 12
                     stepSize: 0.5
+                    defaultValue: 0
                     value: root.liveGainValue
                     fillColor: root.fillColor
                     trackColor: "#101010"
                     borderColor: root.edgeColor
                     onMoved: function(nextValue) {
+                        root.gainCommitPending = false
                         root.liveGainValue = nextValue
-                        root.controller.preview_strip_gain(root.stripIndex, nextValue)
+                        root.previewGainValue = nextValue
+                        root.previewDirty = true
                     }
                     onReleased: function(nextValue) {
                         root.liveGainValue = nextValue
+                        root.pendingGainValue = nextValue
+                        root.gainCommitPending = true
+                        root.previewDirty = false
                         root.controller.set_strip_gain(root.stripIndex, nextValue)
                     }
                 }
@@ -265,6 +313,21 @@ Rectangle {
                 MiniKnob {
                     Layout.fillWidth: true
                     label: "Gate"
+                    from: 0
+                    to: 10
+                    defaultValue: 0
+                    value: root.liveGateValue
+                    accentColor: "#b98e52"
+                    onMoved: function(nextValue) {
+                        root.gateCommitPending = false
+                        root.liveGateValue = nextValue
+                    }
+                    onReleased: function(nextValue) {
+                        root.liveGateValue = nextValue
+                        root.pendingGateValue = nextValue
+                        root.gateCommitPending = true
+                        root.controller.set_strip_gate(root.stripIndex, nextValue)
+                    }
                 }
             }
 

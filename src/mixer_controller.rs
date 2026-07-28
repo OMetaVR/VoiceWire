@@ -1,8 +1,8 @@
 use cxx_qt::CxxQtType;
 use cxx_qt_lib::QString;
 
-use crate::backend::pipewire::PipeWireDiscoveryBackend;
 use crate::backend::BackendCommand;
+use crate::backend::pipewire::PipeWireDiscoveryBackend;
 use crate::controller::AppController;
 
 fn to_qstring_json(session: &crate::model::SessionState) -> QString {
@@ -40,6 +40,9 @@ mod qobject {
         fn set_strip_gain(self: Pin<&mut MixerController>, strip_index: i32, gain_db: f32);
 
         #[qinvokable]
+        fn set_strip_gate(self: Pin<&mut MixerController>, strip_index: i32, gate: f32);
+
+        #[qinvokable]
         fn preview_strip_gain(self: Pin<&mut MixerController>, strip_index: i32, gain_db: f32);
 
         #[qinvokable]
@@ -47,6 +50,9 @@ mod qobject {
 
         #[qinvokable]
         fn preview_bus_gain(self: Pin<&mut MixerController>, bus_index: i32, gain_db: f32);
+
+        #[qinvokable]
+        fn preview_app_level(self: Pin<&mut MixerController>, app_id: i32, level: f32);
 
         #[qinvokable]
         fn toggle_strip_muted(self: Pin<&mut MixerController>, strip_index: i32);
@@ -147,27 +153,34 @@ impl Drop for MixerControllerRust {
 
 impl qobject::MixerController {
     fn sync_state_json(mut self: core::pin::Pin<&mut Self>) {
-        let json = {
+        let (json, unchanged) = {
             let borrowed = self.as_ref();
             let rust = borrowed.rust();
-            to_qstring_json(rust.app.session())
+            let next = to_qstring_json(rust.app.session());
+            let unchanged = rust.state_json == next;
+            (next, unchanged)
         };
+        if unchanged {
+            return;
+        }
         self.as_mut().set_state_json(json);
     }
 
     fn sync_meter_json(mut self: core::pin::Pin<&mut Self>) {
-        let json = {
+        let (json, unchanged) = {
             let borrowed = self.as_ref();
             let rust = borrowed.rust();
-            to_qstring_meter_json(rust.app.session())
+            let next = to_qstring_meter_json(rust.app.session());
+            let unchanged = rust.meter_json == next;
+            (next, unchanged)
         };
+        if unchanged {
+            return;
+        }
         self.as_mut().set_meter_json(json);
     }
 
-    fn dispatch_command(
-        mut self: core::pin::Pin<&mut Self>,
-        command: BackendCommand,
-    ) {
+    fn dispatch_command(mut self: core::pin::Pin<&mut Self>, command: BackendCommand) {
         {
             let mut rust = self.as_mut().rust_mut();
             rust.as_mut().get_mut().app.dispatch(command);
@@ -193,6 +206,16 @@ impl qobject::MixerController {
         self.dispatch_command(BackendCommand::SetStripGain {
             strip_index: strip_index as usize,
             gain_db,
+        });
+    }
+
+    fn set_strip_gate(self: core::pin::Pin<&mut Self>, strip_index: i32, gate: f32) {
+        if strip_index < 0 {
+            return;
+        }
+        self.dispatch_command(BackendCommand::SetStripGate {
+            strip_index: strip_index as usize,
+            gate,
         });
     }
 
@@ -234,6 +257,20 @@ impl qobject::MixerController {
             });
     }
 
+    fn preview_app_level(self: core::pin::Pin<&mut Self>, app_id: i32, level: f32) {
+        if app_id < 0 {
+            return;
+        }
+        let mut rust = self.rust_mut();
+        rust.as_mut()
+            .get_mut()
+            .app
+            .dispatch(BackendCommand::PreviewAppLevel {
+                app_id: app_id as u32,
+                level,
+            });
+    }
+
     fn toggle_strip_muted(self: core::pin::Pin<&mut Self>, strip_index: i32) {
         if strip_index < 0 {
             return;
@@ -270,11 +307,7 @@ impl qobject::MixerController {
         });
     }
 
-    fn set_strip_device(
-        self: core::pin::Pin<&mut Self>,
-        strip_index: i32,
-        device_name: &QString,
-    ) {
+    fn set_strip_device(self: core::pin::Pin<&mut Self>, strip_index: i32, device_name: &QString) {
         if strip_index < 0 {
             return;
         }
@@ -310,11 +343,7 @@ impl qobject::MixerController {
         });
     }
 
-    fn toggle_virtual_app_muted(
-        self: core::pin::Pin<&mut Self>,
-        strip_index: i32,
-        app_index: i32,
-    ) {
+    fn toggle_virtual_app_muted(self: core::pin::Pin<&mut Self>, strip_index: i32, app_index: i32) {
         if strip_index < 0 || app_index < 0 {
             return;
         }
@@ -342,10 +371,7 @@ impl qobject::MixerController {
     fn set_quick_route_enabled(mut self: core::pin::Pin<&mut Self>, enabled: bool) {
         {
             let mut rust = self.as_mut().rust_mut();
-            rust.as_mut()
-                .get_mut()
-                .app
-                .set_quick_route_enabled(enabled);
+            rust.as_mut().get_mut().app.set_quick_route_enabled(enabled);
         }
         self.as_mut().sync_state_json();
     }

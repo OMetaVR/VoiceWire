@@ -14,6 +14,20 @@ Rectangle {
     readonly property real contentHeight: Math.max(0, height - 2)
     readonly property real warningHeight: contentHeight * warningThreshold
 
+    Behavior on displayLeft {
+        NumberAnimation {
+            duration: 45
+            easing.type: Easing.OutQuad
+        }
+    }
+
+    Behavior on displayRight {
+        NumberAnimation {
+            duration: 45
+            easing.type: Easing.OutQuad
+        }
+    }
+
     implicitWidth: 20
     implicitHeight: 320
     color: root.trackColor
@@ -37,13 +51,6 @@ Rectangle {
         width: Math.floor((parent.width - 3) / 2)
         height: Math.max(0, Math.min(root.warningHeight, root.contentHeight * root.displayLeft))
         color: root.fillColor
-
-        Behavior on height {
-            NumberAnimation {
-                duration: 45
-                easing.type: Easing.OutCubic
-            }
-        }
     }
 
     Rectangle {
@@ -54,13 +61,6 @@ Rectangle {
         width: Math.floor((parent.width - 3) / 2)
         height: Math.max(0, root.contentHeight * root.displayLeft - root.warningHeight)
         color: root.warningColor
-
-        Behavior on height {
-            NumberAnimation {
-                duration: 45
-                easing.type: Easing.OutCubic
-            }
-        }
     }
 
     Rectangle {
@@ -70,13 +70,6 @@ Rectangle {
         width: Math.floor((parent.width - 3) / 2)
         height: Math.max(0, Math.min(root.warningHeight, root.contentHeight * root.displayRight))
         color: root.fillColor
-
-        Behavior on height {
-            NumberAnimation {
-                duration: 45
-                easing.type: Easing.OutCubic
-            }
-        }
     }
 
     Rectangle {
@@ -87,13 +80,6 @@ Rectangle {
         width: Math.floor((parent.width - 3) / 2)
         height: Math.max(0, root.contentHeight * root.displayRight - root.warningHeight)
         color: root.warningColor
-
-        Behavior on height {
-            NumberAnimation {
-                duration: 45
-                easing.type: Easing.OutCubic
-            }
-        }
     }
 
     Repeater {

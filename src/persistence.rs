@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +23,8 @@ struct PersistedSession {
 struct PersistedStrip {
     device_name: String,
     gain_db: f32,
+    #[serde(default)]
+    gate: f32,
     muted: bool,
     solo: bool,
     mono: bool,
@@ -55,6 +59,14 @@ struct PersistedAppRoute {
     muted: bool,
 }
 
+struct SaveQueue {
+    pending: Mutex<Option<PersistedSession>>,
+    writer: Mutex<()>,
+    wake: Condvar,
+}
+
+static SAVE_QUEUE: OnceLock<Arc<SaveQueue>> = OnceLock::new();
+
 pub fn load_session() -> Option<SessionState> {
     let path = session_path()?;
     let contents = fs::read_to_string(path).ok()?;
@@ -66,9 +78,68 @@ pub fn load_session() -> Option<SessionState> {
 
 pub fn save_session_async(session: SessionState) {
     let persisted = PersistedSession::from(&session);
-    std::thread::spawn(move || {
-        save_session_inner(persisted);
+    let queue = SAVE_QUEUE.get_or_init(|| {
+        let queue = Arc::new(SaveQueue {
+            pending: Mutex::new(None),
+            writer: Mutex::new(()),
+            wake: Condvar::new(),
+        });
+        let worker_queue = Arc::clone(&queue);
+        std::thread::spawn(move || {
+            loop {
+                let mut pending = worker_queue
+                    .pending
+                    .lock()
+                    .expect("session save queue mutex should not be poisoned");
+                while pending.is_none() {
+                    pending = worker_queue
+                        .wake
+                        .wait(pending)
+                        .expect("session save queue mutex should not be poisoned");
+                }
+                drop(pending);
+
+                std::thread::sleep(Duration::from_millis(120));
+
+            let _writer = worker_queue
+                .writer
+                .lock()
+                .expect("session writer mutex should not be poisoned");
+            let persisted = worker_queue
+                .pending
+                .lock()
+                    .expect("session save queue mutex should not be poisoned")
+                    .take();
+                if let Some(persisted) = persisted {
+                    save_session_inner(persisted);
+                }
+            }
+        });
+        queue
     });
+    *queue
+        .pending
+        .lock()
+        .expect("session save queue mutex should not be poisoned") = Some(persisted);
+    queue.wake.notify_one();
+}
+
+pub fn flush_session_saves() {
+    let Some(queue) = SAVE_QUEUE.get() else {
+        return;
+    };
+    let _writer = queue
+        .writer
+        .lock()
+        .expect("session writer mutex should not be poisoned");
+    let persisted = queue
+        .pending
+        .lock()
+        .expect("session save queue mutex should not be poisoned")
+        .take();
+    if let Some(persisted) = persisted {
+        save_session_inner(persisted);
+    }
 }
 
 fn save_session_inner(persisted: PersistedSession) {
@@ -85,7 +156,10 @@ fn save_session_inner(persisted: PersistedSession) {
     let Ok(json) = serde_json::to_string_pretty(&persisted) else {
         return;
     };
-    let _ = fs::write(path, json);
+    let temporary_path = path.with_extension("json.tmp");
+    if fs::write(&temporary_path, json).is_ok() {
+        let _ = fs::rename(temporary_path, path);
+    }
 }
 
 fn apply_persisted_session(session: &mut SessionState, persisted: PersistedSession) {
@@ -94,6 +168,7 @@ fn apply_persisted_session(session: &mut SessionState, persisted: PersistedSessi
     for (strip, saved) in session.strips.iter_mut().zip(persisted.strips) {
         strip.device_name = saved.device_name;
         strip.gain_db = saved.gain_db.clamp(-60.0, 12.0);
+        strip.gate = saved.gate.clamp(0.0, 10.0);
         strip.muted = saved.muted;
         strip.solo = saved.solo;
         strip.mono = saved.mono;
@@ -156,6 +231,7 @@ impl From<&SessionState> for PersistedSession {
                 .map(|strip| PersistedStrip {
                     device_name: strip.device_name.clone(),
                     gain_db: strip.gain_db,
+                    gate: strip.gate,
                     muted: strip.muted,
                     solo: strip.solo,
                     mono: strip.mono,

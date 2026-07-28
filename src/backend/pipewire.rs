@@ -1,14 +1,19 @@
-use std::io::Read;
+use std::collections::{HashMap, VecDeque};
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::backend::{AudioBackend, BackendCommand, BackendEvent};
-use crate::model::{AppRouteState, DeviceOption, EndpointKind, MeterSnapshot, SessionState, StereoLevels};
+use crate::model::{
+    AppRouteState, DeviceOption, EndpointKind, MeterSnapshot, RememberedAppRouteState,
+    SessionState, StereoLevels,
+};
 
 const VIRTUAL_INPUT_ENDPOINTS: [VirtualEndpointSpec; 3] = [
     VirtualEndpointSpec::new("voicewire.in1", "VoiceWire VAIO", "Audio/Sink"),
@@ -146,6 +151,82 @@ struct StripMeterTap {
     handle: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct StripGateState {
+    open: bool,
+    release_deadline: Option<Instant>,
+}
+
+struct AppRouteSubscription {
+    dirty: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    child_slot: Arc<Mutex<Option<Child>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+enum ControlKey {
+    NodeVolume(String, String),
+    NodeMute(String, String),
+    AppRoute(u32),
+    AppVolume(u32),
+    AppMute(u32),
+}
+
+enum ControlCommand {
+    NodeVolume {
+        kind: String,
+        name: String,
+        volume: String,
+    },
+    NodeMute {
+        kind: String,
+        name: String,
+        muted: bool,
+    },
+    AppRoute {
+        app_id: u32,
+        target: String,
+    },
+    AppVolume {
+        app_id: u32,
+        level: f32,
+    },
+    AppMute {
+        app_id: u32,
+        muted: bool,
+    },
+}
+
+#[derive(Default)]
+struct ControlQueueState {
+    order: VecDeque<ControlKey>,
+    pending: HashMap<ControlKey, ControlCommand>,
+    stopping: bool,
+}
+
+struct PulseControlWorker {
+    queue: Arc<(Mutex<ControlQueueState>, Condvar)>,
+    errors: Arc<Mutex<Vec<String>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+type DeviceDiscoveryResult = Result<(Vec<PipeWireDeviceNode>, Vec<PipeWireDeviceNode>), String>;
+
+struct DeviceDiscoveryWorker {
+    request_tx: Option<Sender<()>>,
+    result_rx: Receiver<DeviceDiscoveryResult>,
+    request_pending: bool,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct AppRouteRefreshWorker {
+    request_tx: Option<Sender<(u64, Vec<RememberedAppRouteState>)>>,
+    result_rx: Receiver<(u64, Result<Vec<AppRouteState>, String>)>,
+    request_pending: bool,
+    handle: Option<JoinHandle<()>>,
+}
+
 pub struct PipeWireDiscoveryBackend {
     known_input_nodes: Vec<PipeWireDeviceNode>,
     known_input_devices: Vec<DeviceOption>,
@@ -157,6 +238,14 @@ pub struct PipeWireDiscoveryBackend {
     bus_bindings: Vec<BusBinding>,
     active_routes: Vec<ActiveRoute>,
     strip_meter_taps: Vec<StripMeterTap>,
+    strip_gate_states: Vec<StripGateState>,
+    app_route_subscription: Option<AppRouteSubscription>,
+    app_route_generation: u64,
+    app_route_refresh_dirty: bool,
+    app_route_refresh_not_before: Option<Instant>,
+    control_worker: PulseControlWorker,
+    device_discovery_worker: DeviceDiscoveryWorker,
+    app_route_refresh_worker: AppRouteRefreshWorker,
     last_device_refresh: Option<Instant>,
 }
 
@@ -173,7 +262,230 @@ impl Default for PipeWireDiscoveryBackend {
             bus_bindings: Vec::new(),
             active_routes: Vec::new(),
             strip_meter_taps: Vec::new(),
+            strip_gate_states: Vec::new(),
+            app_route_subscription: None,
+            app_route_generation: 0,
+            app_route_refresh_dirty: false,
+            app_route_refresh_not_before: None,
+            control_worker: PulseControlWorker::spawn(),
+            device_discovery_worker: DeviceDiscoveryWorker::spawn(),
+            app_route_refresh_worker: AppRouteRefreshWorker::spawn(),
             last_device_refresh: None,
+        }
+    }
+}
+
+impl ControlCommand {
+    fn key(&self) -> ControlKey {
+        match self {
+            Self::NodeVolume { kind, name, .. } => {
+                ControlKey::NodeVolume(kind.clone(), name.clone())
+            }
+            Self::NodeMute { kind, name, .. } => ControlKey::NodeMute(kind.clone(), name.clone()),
+            Self::AppRoute { app_id, .. } => ControlKey::AppRoute(*app_id),
+            Self::AppVolume { app_id, .. } => ControlKey::AppVolume(*app_id),
+            Self::AppMute { app_id, .. } => ControlKey::AppMute(*app_id),
+        }
+    }
+
+    fn execute(self) -> Result<(), String> {
+        match self {
+            Self::NodeVolume { kind, name, volume } => {
+                set_pulse_node_volume_checked(&kind, &name, &volume)
+            }
+            Self::NodeMute { kind, name, muted } => {
+                set_pulse_node_mute_checked(&kind, &name, muted)
+            }
+            Self::AppRoute { app_id, target } => move_sink_input_to_target(app_id, &target),
+            Self::AppVolume { app_id, level } => set_sink_input_volume(app_id, level),
+            Self::AppMute { app_id, muted } => set_sink_input_mute(app_id, muted),
+        }
+    }
+}
+
+impl PulseControlWorker {
+    fn spawn() -> Self {
+        let queue = Arc::new((Mutex::new(ControlQueueState::default()), Condvar::new()));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let thread_queue = Arc::clone(&queue);
+        let thread_errors = Arc::clone(&errors);
+        let handle = thread::spawn(move || {
+            loop {
+                let command = {
+                    let (state_mutex, wake) = &*thread_queue;
+                    let mut state = state_mutex
+                        .lock()
+                        .expect("audio control queue mutex should not be poisoned");
+                    while state.order.is_empty() && !state.stopping {
+                        state = wake
+                            .wait(state)
+                            .expect("audio control queue mutex should not be poisoned");
+                    }
+                    if state.stopping {
+                        return;
+                    }
+                    let Some(key) = state.order.pop_front() else {
+                        continue;
+                    };
+                    state.pending.remove(&key)
+                };
+
+                if let Some(command) = command {
+                    if let Err(message) = command.execute() {
+                        thread_errors
+                            .lock()
+                            .expect("audio control error mutex should not be poisoned")
+                            .push(message);
+                    }
+                }
+            }
+        });
+
+        Self {
+            queue,
+            errors,
+            handle: Some(handle),
+        }
+    }
+
+    fn enqueue(&self, command: ControlCommand) {
+        let key = command.key();
+        let (state_mutex, wake) = &*self.queue;
+        let mut state = state_mutex
+            .lock()
+            .expect("audio control queue mutex should not be poisoned");
+        if state.stopping {
+            return;
+        }
+        if !state.pending.contains_key(&key) {
+            state.order.push_back(key.clone());
+        }
+        state.pending.insert(key, command);
+        wake.notify_one();
+    }
+
+    fn take_errors(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .errors
+                .lock()
+                .expect("audio control error mutex should not be poisoned"),
+        )
+    }
+
+    fn stop(&mut self) {
+        let (state_mutex, wake) = &*self.queue;
+        {
+            let mut state = state_mutex
+                .lock()
+                .expect("audio control queue mutex should not be poisoned");
+            state.stopping = true;
+            state.order.clear();
+            state.pending.clear();
+        }
+        wake.notify_one();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl DeviceDiscoveryWorker {
+    fn spawn() -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<()>();
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            while request_rx.recv().is_ok() {
+                if result_tx.send(discover_device_nodes()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            request_tx: Some(request_tx),
+            result_rx,
+            request_pending: false,
+            handle: Some(handle),
+        }
+    }
+
+    fn request(&mut self) {
+        if self.request_pending {
+            return;
+        }
+        if self
+            .request_tx
+            .as_ref()
+            .is_some_and(|sender| sender.send(()).is_ok())
+        {
+            self.request_pending = true;
+        }
+    }
+
+    fn take_result(&mut self) -> Option<DeviceDiscoveryResult> {
+        let result = self.result_rx.try_recv().ok()?;
+        self.request_pending = false;
+        Some(result)
+    }
+
+    fn stop(&mut self) {
+        self.request_tx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl AppRouteRefreshWorker {
+    fn spawn() -> Self {
+        let (request_tx, request_rx) =
+            mpsc::channel::<(u64, Vec<RememberedAppRouteState>)>();
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            while let Ok((generation, remembered_routes)) = request_rx.recv() {
+                let result = refresh_app_routes_in_background(&remembered_routes);
+                if result_tx.send((generation, result)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            request_tx: Some(request_tx),
+            result_rx,
+            request_pending: false,
+            handle: Some(handle),
+        }
+    }
+
+    fn request(
+        &mut self,
+        generation: u64,
+        remembered_routes: Vec<RememberedAppRouteState>,
+    ) -> bool {
+        if self.request_pending {
+            return false;
+        }
+        if self
+            .request_tx
+            .as_ref()
+            .is_some_and(|sender| sender.send((generation, remembered_routes)).is_ok())
+        {
+            self.request_pending = true;
+            return true;
+        }
+        false
+    }
+
+    fn take_result(&mut self) -> Option<(u64, Result<Vec<AppRouteState>, String>)> {
+        let result = self.result_rx.try_recv().ok()?;
+        self.request_pending = false;
+        Some(result)
+    }
+
+    fn stop(&mut self) {
+        self.request_tx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -182,32 +494,39 @@ impl AudioBackend for PipeWireDiscoveryBackend {
     fn handle(&mut self, session: &SessionState, command: BackendCommand) -> Vec<BackendEvent> {
         let is_start = matches!(&command, BackendCommand::Start);
         let is_shutdown = matches!(&command, BackendCommand::Shutdown);
-        let mut events = match &command {
+        let mut events = self.take_background_events();
+        match &command {
             BackendCommand::Start
             | BackendCommand::SetStripDevice { .. }
-            | BackendCommand::SetBusDevice { .. } => self.refresh_device_events(),
+            | BackendCommand::SetBusDevice { .. } => self.request_device_refresh(),
             BackendCommand::RefreshMeters => {
-                self.refresh_device_events_if_stale(Duration::from_millis(1000))
+                self.request_device_refresh_if_stale(Duration::from_millis(1000));
             }
-            _ => Vec::new(),
-        };
+            _ => {}
+        }
         let devices_changed = events
             .iter()
             .any(|event| matches!(event, BackendEvent::DevicesUpdated { .. }));
 
         match command {
             BackendCommand::Start => {
+                self.ensure_app_route_subscription();
                 if self.connected {
                     events.push(BackendEvent::ConnectionStateChanged { connected: true });
                 }
                 events.extend(self.ensure_virtual_endpoints());
-                events.extend(self.ensure_session_bus_bindings(session));
+                if !self.known_output_nodes.is_empty() {
+                    events.extend(self.ensure_session_bus_bindings(session));
+                }
+                self.sync_strip_meter_taps(session);
+                self.update_strip_gate_states(session);
                 self.sync_all_runtime_mix_state(session);
                 events.extend(self.sync_all_routes(session));
-                events.extend(self.refresh_app_routes(session));
+                self.request_app_route_refresh(session);
                 events.push(self.next_meter_event(session));
             }
             BackendCommand::Shutdown => {
+                self.stop_app_route_subscription();
                 self.clear_all_routes();
                 self.stop_all_meter_taps();
                 self.destroy_virtual_endpoints();
@@ -229,11 +548,35 @@ impl AudioBackend for PipeWireDiscoveryBackend {
                 temp.set_bus_gain(bus_index, clamped);
                 self.sync_bus_runtime_state(bus_index, &temp);
             }
+            BackendCommand::PreviewAppLevel { app_id, level } => {
+                self.defer_app_route_refresh();
+                self.control_worker.enqueue(ControlCommand::AppVolume {
+                    app_id,
+                    level: level.clamp(0.0, 1.0),
+                });
+            }
             BackendCommand::RefreshMeters => {
+                let gate_changes = self.update_strip_gate_states(session);
+                for strip_index in gate_changes {
+                    self.sync_strip_runtime_state(strip_index, session);
+                }
+                if self.take_app_route_dirty() {
+                    self.app_route_refresh_dirty = true;
+                }
+                let refresh_delay_elapsed = self
+                    .app_route_refresh_not_before
+                    .is_none_or(|deadline| deadline <= Instant::now());
+                if self.app_route_refresh_dirty
+                    && refresh_delay_elapsed
+                    && self.request_app_route_refresh(session)
+                {
+                    self.app_route_refresh_dirty = false;
+                    self.app_route_refresh_not_before = None;
+                }
                 events.push(self.next_meter_event(session));
             }
             BackendCommand::RefreshAppRoutes => {
-                events.extend(self.refresh_app_routes(session));
+                self.request_app_route_refresh(session);
             }
             BackendCommand::ToggleRoute {
                 strip_index,
@@ -271,6 +614,20 @@ impl AudioBackend for PipeWireDiscoveryBackend {
                 self.sync_strip_runtime_state(strip_index, &temp);
                 events.push(self.next_meter_event_with_update(session, |temp| {
                     temp.set_strip_gain(strip_index, clamped);
+                }));
+            }
+            BackendCommand::SetStripGate { strip_index, gate } => {
+                let clamped = gate.clamp(0.0, 10.0);
+                events.push(BackendEvent::StripGateChanged {
+                    strip_index,
+                    gate: clamped,
+                });
+                let mut temp = session.clone();
+                temp.set_strip_gate(strip_index, clamped);
+                self.update_strip_gate_states(&temp);
+                self.sync_strip_runtime_state(strip_index, &temp);
+                events.push(self.next_meter_event_with_update(session, |temp| {
+                    temp.set_strip_gate(strip_index, clamped);
                 }));
             }
             BackendCommand::SetBusGain { bus_index, gain_db } => {
@@ -352,11 +709,15 @@ impl AudioBackend for PipeWireDiscoveryBackend {
                 });
                 let mut temp = session.clone();
                 temp.set_strip_device(strip_index, &device_name);
+                self.update_strip_gate_states(&temp);
                 self.sync_strip_runtime_state(strip_index, &temp);
                 events.extend(self.sync_strip_routes(strip_index, &temp));
                 events.push(self.next_meter_event(session));
             }
-            BackendCommand::SetBusDevice { bus_index, device_name } => {
+            BackendCommand::SetBusDevice {
+                bus_index,
+                device_name,
+            } => {
                 let binding_events = self.bind_hardware_bus(bus_index, &device_name);
                 let resolved_name = binding_events.iter().find_map(|event| match event {
                     BackendEvent::BusBindingChanged {
@@ -417,45 +778,39 @@ impl AudioBackend for PipeWireDiscoveryBackend {
                 }));
             }
             BackendCommand::SetAppRoute { app_id, target } => {
-                if let Err(message) = move_sink_input_to_target(app_id, target.as_str()) {
-                    events.push(BackendEvent::BackendError { message });
-                }
-                let mut temp = session.clone();
-                let mut routes = temp.app_routes.clone();
+                self.defer_app_route_refresh();
+                self.control_worker.enqueue(ControlCommand::AppRoute {
+                    app_id,
+                    target: target.clone(),
+                });
+                let mut routes = session.app_routes.clone();
                 if let Some(route) = routes.iter_mut().find(|route| route.id == app_id) {
-                    route.target = target.clone();
-                    temp.set_app_routes(routes);
+                    route.target = target;
+                    events.push(BackendEvent::AppRoutesUpdated { routes });
                 }
-                events.extend(self.refresh_app_routes(&temp));
             }
             BackendCommand::SetAppLevel { app_id, level } => {
-                if let Err(message) = set_sink_input_volume(app_id, level.clamp(0.0, 1.0)) {
-                    events.push(BackendEvent::BackendError { message });
-                }
-                let mut temp = session.clone();
-                let mut routes = temp.app_routes.clone();
+                self.defer_app_route_refresh();
+                let level = level.clamp(0.0, 1.0);
+                self.control_worker
+                    .enqueue(ControlCommand::AppVolume { app_id, level });
+                let mut routes = session.app_routes.clone();
                 if let Some(route) = routes.iter_mut().find(|route| route.id == app_id) {
-                    route.level = level.clamp(0.0, 1.0);
-                    temp.set_app_routes(routes);
+                    route.level = level;
+                    events.push(BackendEvent::AppRoutesUpdated { routes });
                 }
-                events.extend(self.refresh_app_routes(&temp));
             }
             BackendCommand::ToggleAppMuted { app_id } => {
-                match find_sink_input_muted(app_id) {
-                    Ok(muted) => {
-                        if let Err(message) = set_sink_input_mute(app_id, !muted) {
-                            events.push(BackendEvent::BackendError { message });
-                        }
-                    }
-                    Err(message) => events.push(BackendEvent::BackendError { message }),
-                }
-                let mut temp = session.clone();
-                let mut routes = temp.app_routes.clone();
+                self.defer_app_route_refresh();
+                let mut routes = session.app_routes.clone();
                 if let Some(route) = routes.iter_mut().find(|route| route.id == app_id) {
                     route.muted = !route.muted;
-                    temp.set_app_routes(routes);
+                    self.control_worker.enqueue(ControlCommand::AppMute {
+                        app_id,
+                        muted: route.muted,
+                    });
+                    events.push(BackendEvent::AppRoutesUpdated { routes });
                 }
-                events.extend(self.refresh_app_routes(&temp));
             }
         }
 
@@ -470,14 +825,75 @@ impl AudioBackend for PipeWireDiscoveryBackend {
 }
 
 impl PipeWireDiscoveryBackend {
-    fn refresh_device_events_if_stale(&mut self, max_age: Duration) -> Vec<BackendEvent> {
+    fn ensure_app_route_subscription(&mut self) {
+        if self.app_route_subscription.is_none() {
+            self.app_route_subscription = Some(AppRouteSubscription::spawn());
+        }
+    }
+
+    fn stop_app_route_subscription(&mut self) {
+        if let Some(mut subscription) = self.app_route_subscription.take() {
+            subscription.stop();
+        }
+    }
+
+    fn take_app_route_dirty(&self) -> bool {
+        self.app_route_subscription
+            .as_ref()
+            .is_some_and(AppRouteSubscription::take_dirty)
+    }
+
+    fn request_device_refresh_if_stale(&mut self, max_age: Duration) {
         if self
             .last_device_refresh
             .is_some_and(|instant| instant.elapsed() < max_age)
         {
-            return Vec::new();
+            return;
         }
-        self.refresh_device_events()
+        self.request_device_refresh();
+    }
+
+    fn request_device_refresh(&mut self) {
+        self.last_device_refresh = Some(Instant::now());
+        self.device_discovery_worker.request();
+    }
+
+    fn request_app_route_refresh(&mut self, session: &SessionState) -> bool {
+        self.app_route_refresh_worker.request(
+            self.app_route_generation,
+            session.remembered_app_routes.clone(),
+        )
+    }
+
+    fn defer_app_route_refresh(&mut self) {
+        self.app_route_generation = self.app_route_generation.wrapping_add(1);
+        self.app_route_refresh_dirty = true;
+        self.app_route_refresh_not_before =
+            Some(Instant::now() + Duration::from_millis(180));
+    }
+
+    fn take_background_events(&mut self) -> Vec<BackendEvent> {
+        let mut events = self
+            .control_worker
+            .take_errors()
+            .into_iter()
+            .map(|message| BackendEvent::BackendError { message })
+            .collect::<Vec<_>>();
+
+        if let Some(result) = self.device_discovery_worker.take_result() {
+            events.extend(self.apply_device_discovery_result(result));
+        }
+
+        if let Some((generation, result)) = self.app_route_refresh_worker.take_result() {
+            if generation == self.app_route_generation {
+                match result {
+                    Ok(routes) => events.push(BackendEvent::AppRoutesUpdated { routes }),
+                    Err(message) => events.push(BackendEvent::BackendError { message }),
+                }
+            }
+        }
+
+        events
     }
 
     fn ensure_virtual_endpoints(&mut self) -> Vec<BackendEvent> {
@@ -563,9 +979,11 @@ impl PipeWireDiscoveryBackend {
         self.next_meter_event(&temp)
     }
 
-    fn refresh_device_events(&mut self) -> Vec<BackendEvent> {
-        self.last_device_refresh = Some(Instant::now());
-        match discover_device_nodes() {
+    fn apply_device_discovery_result(
+        &mut self,
+        result: DeviceDiscoveryResult,
+    ) -> Vec<BackendEvent> {
+        match result {
             Ok((input_nodes, output_nodes)) => {
                 let input_devices: Vec<_> = input_nodes
                     .iter()
@@ -616,7 +1034,12 @@ impl PipeWireDiscoveryBackend {
             .strips
             .iter()
             .enumerate()
-            .map(|(strip_index, _)| (strip_index, self.resolve_strip_meter_target(strip_index, session)))
+            .map(|(strip_index, _)| {
+                (
+                    strip_index,
+                    self.resolve_strip_meter_target(strip_index, session),
+                )
+            })
             .collect::<Vec<_>>();
 
         let mut retained = Vec::with_capacity(self.strip_meter_taps.len());
@@ -684,7 +1107,10 @@ impl PipeWireDiscoveryBackend {
                 let mut levels = self.read_strip_levels(strip_index);
 
                 if !self.strip_is_audible(strip_index, session) {
-                    levels = StereoLevels { left: 0.0, right: 0.0 };
+                    levels = StereoLevels {
+                        left: 0.0,
+                        right: 0.0,
+                    };
                 }
 
                 if strip.mono {
@@ -708,7 +1134,8 @@ impl PipeWireDiscoveryBackend {
                     .get(strip_index)
                     .map(|levels| levels.left.max(levels.right))
                     .unwrap_or(0.0);
-                strip.apps
+                strip
+                    .apps
                     .iter()
                     .map(|app| {
                         if strip.muted || app.muted {
@@ -773,6 +1200,66 @@ impl PipeWireDiscoveryBackend {
             })
     }
 
+    fn update_strip_gate_states(&mut self, session: &SessionState) -> Vec<usize> {
+        self.strip_gate_states
+            .resize(session.strips.len(), StripGateState::default());
+
+        let now = Instant::now();
+        let mut changed = Vec::new();
+
+        for (strip_index, strip) in session.strips.iter().enumerate() {
+            let should_gate = strip.endpoint_kind == EndpointKind::HardwareInput
+                && !strip.device_name.is_empty()
+                && strip.gate > 0.0;
+            let peak = if should_gate {
+                let levels = self.read_strip_levels(strip_index);
+                levels.left.max(levels.right)
+            } else {
+                0.0
+            };
+            let state = &mut self.strip_gate_states[strip_index];
+
+            if !should_gate {
+                if !state.open || state.release_deadline.is_some() {
+                    state.open = true;
+                    state.release_deadline = None;
+                    changed.push(strip_index);
+                }
+                continue;
+            }
+
+            let open_threshold = gate_open_threshold(strip.gate);
+            let close_threshold = open_threshold * 0.55;
+
+            if peak >= open_threshold {
+                let was_open = state.open;
+                state.open = true;
+                state.release_deadline = Some(now + gate_hold_duration(strip.gate));
+                if !was_open {
+                    changed.push(strip_index);
+                }
+                continue;
+            }
+
+            if state.open {
+                let hold_active = state
+                    .release_deadline
+                    .is_some_and(|deadline| deadline > now);
+                if hold_active || peak >= close_threshold {
+                    continue;
+                }
+
+                state.open = false;
+                state.release_deadline = None;
+                changed.push(strip_index);
+            } else {
+                state.release_deadline = None;
+            }
+        }
+
+        changed
+    }
+
     fn sync_all_runtime_mix_state(&self, session: &SessionState) {
         self.sync_all_strip_runtime_states(session);
         self.sync_all_bus_runtime_states(session);
@@ -794,15 +1281,45 @@ impl PipeWireDiscoveryBackend {
         let Some(strip) = session.strips.get(strip_index) else {
             return;
         };
+
+        if strip.endpoint_kind == EndpointKind::HardwareInput {
+            let Some(node) = self.resolve_input_node(&strip.device_name) else {
+                return;
+            };
+            let gate_open = self
+                .strip_gate_states
+                .get(strip_index)
+                .map(|state| state.open)
+                .unwrap_or(true);
+            let volume = if strip.gate > 0.0 && !gate_open {
+                "0".to_string()
+            } else {
+                pulse_volume_arg_for_gain_db(strip.gain_db)
+            };
+            self.control_worker.enqueue(ControlCommand::NodeVolume {
+                kind: "source".into(),
+                name: node.node_name.clone(),
+                volume,
+            });
+            return;
+        }
+
         let targets = self.resolve_strip_volume_targets(strip_index, session);
         if targets.is_empty() {
             return;
         }
-        let volume = db_to_pulse_volume(&strip.gain_db);
         let audible = self.strip_is_audible(strip_index, session);
         for (kind, target_name) in targets {
-            set_pulse_node_volume(kind, target_name.as_str(), volume.as_str());
-            set_pulse_node_mute(kind, target_name.as_str(), !audible);
+            self.control_worker.enqueue(ControlCommand::NodeVolume {
+                kind: kind.into(),
+                name: target_name.clone(),
+                volume: pulse_volume_arg_for_gain_db(strip.gain_db),
+            });
+            self.control_worker.enqueue(ControlCommand::NodeMute {
+                kind: kind.into(),
+                name: target_name,
+                muted: !audible,
+            });
         }
     }
 
@@ -813,8 +1330,16 @@ impl PipeWireDiscoveryBackend {
         let Some(target_name) = self.resolve_bus_volume_target(bus_index) else {
             return;
         };
-        set_pulse_node_volume("sink", target_name, db_to_pulse_volume(&bus.gain_db).as_str());
-        set_pulse_node_mute("sink", target_name, bus.muted);
+        self.control_worker.enqueue(ControlCommand::NodeVolume {
+            kind: "sink".into(),
+            name: target_name.into(),
+            volume: pulse_volume_arg_for_gain_db(bus.gain_db),
+        });
+        self.control_worker.enqueue(ControlCommand::NodeMute {
+            kind: "sink".into(),
+            name: target_name.into(),
+            muted: bus.muted,
+        });
     }
 
     fn resolve_strip_volume_targets(
@@ -873,14 +1398,9 @@ impl PipeWireDiscoveryBackend {
             return false;
         }
 
-        let section_solo_active = session
-            .strips
-            .iter()
-            .any(|candidate| {
-                candidate.endpoint_kind == strip.endpoint_kind
-                    && candidate.solo
-                    && !candidate.muted
-            });
+        let section_solo_active = session.strips.iter().any(|candidate| {
+            candidate.endpoint_kind == strip.endpoint_kind && candidate.solo && !candidate.muted
+        });
         if section_solo_active && !strip.solo {
             return false;
         }
@@ -929,7 +1449,8 @@ impl PipeWireDiscoveryBackend {
         }
 
         if device_name.is_empty() {
-            self.bus_bindings.retain(|binding| binding.bus_index != bus_index);
+            self.bus_bindings
+                .retain(|binding| binding.bus_index != bus_index);
             return vec![BackendEvent::BusBindingChanged {
                 bus_index,
                 device_name: String::new(),
@@ -938,7 +1459,11 @@ impl PipeWireDiscoveryBackend {
 
         let Some(node) = self.resolve_output_node(device_name).cloned() else {
             return vec![BackendEvent::BackendError {
-                message: format!("could not bind {} to unavailable device \"{}\"", bus_label(bus_index), device_name),
+                message: format!(
+                    "could not bind {} to unavailable device \"{}\"",
+                    bus_label(bus_index),
+                    device_name
+                ),
             }];
         };
 
@@ -953,7 +1478,8 @@ impl PipeWireDiscoveryBackend {
             }];
         }
 
-        self.bus_bindings.retain(|binding| binding.bus_index != bus_index);
+        self.bus_bindings
+            .retain(|binding| binding.bus_index != bus_index);
         self.bus_bindings.push(BusBinding {
             bus_index,
             stable_id: node.stable_id.clone(),
@@ -970,11 +1496,9 @@ impl PipeWireDiscoveryBackend {
     fn reconcile_bus_bindings(&mut self) {
         let mut rebound = Vec::with_capacity(self.bus_bindings.len());
         for binding in self.bus_bindings.drain(..) {
-            if let Some(node) = self
-                .known_output_nodes
-                .iter()
-                .find(|node| node.stable_id == binding.stable_id || node.node_name == binding.node_name)
-            {
+            if let Some(node) = self.known_output_nodes.iter().find(|node| {
+                node.stable_id == binding.stable_id || node.node_name == binding.node_name
+            }) {
                 rebound.push(BusBinding {
                     bus_index: binding.bus_index,
                     stable_id: node.stable_id.clone(),
@@ -1068,7 +1592,10 @@ impl PipeWireDiscoveryBackend {
 
         let Some((dest_left, dest_right)) = pick_stereo_ports(
             &dest_ports,
-            &[("playback_FL", "playback_FR"), ("playback_AUX0", "playback_AUX1")],
+            &[
+                ("playback_FL", "playback_FR"),
+                ("playback_AUX0", "playback_AUX1"),
+            ],
         ) else {
             return vec![BackendEvent::BackendError {
                 message: format!("{} has no usable playback ports", bus.destination_name),
@@ -1143,17 +1670,19 @@ impl PipeWireDiscoveryBackend {
 
         match strip.endpoint_kind {
             EndpointKind::HardwareInput => {
-                let node = self
-                    .resolve_input_node(&strip.device_name)
-                    .ok_or_else(|| format!("{} is not assigned to an available input device", strip.title))?;
+                let node = self.resolve_input_node(&strip.device_name).ok_or_else(|| {
+                    format!(
+                        "{} is not assigned to an available input device",
+                        strip.title
+                    )
+                })?;
                 let ports = resolve_output_ports(&node.node_name)?;
                 let links = if strip.mono {
                     build_hardware_input_mono_links(&ports, dest_left, dest_right)
                 } else {
                     build_hardware_input_links(&ports, dest_left, dest_right)
                 };
-                links
-                    .ok_or_else(|| format!("{} has no usable capture ports", strip.device_name))
+                links.ok_or_else(|| format!("{} has no usable capture ports", strip.device_name))
             }
             EndpointKind::VirtualInput => {
                 let node_name = match strip_index {
@@ -1209,54 +1738,14 @@ impl PipeWireDiscoveryBackend {
             _ => None,
         }
     }
-
-    fn refresh_app_routes(&self, session: &SessionState) -> Vec<BackendEvent> {
-        let mut routes = match list_app_routes() {
-            Ok(routes) => routes,
-            Err(message) => return vec![BackendEvent::BackendError { message }],
-        };
-
-        let mut reapplied_settings = false;
-        for route in &routes {
-            let Some(saved) = session.remembered_app_route_for(route) else {
-                continue;
-            };
-
-            if !saved.target.is_empty() && saved.target != route.target {
-                if let Err(message) = move_sink_input_to_target(route.id, saved.target.as_str()) {
-                    return vec![BackendEvent::BackendError { message }];
-                }
-                reapplied_settings = true;
-            }
-
-            if (saved.level - route.level).abs() > 0.01 {
-                if let Err(message) = set_sink_input_volume(route.id, saved.level) {
-                    return vec![BackendEvent::BackendError { message }];
-                }
-                reapplied_settings = true;
-            }
-
-            if saved.muted != route.muted {
-                if let Err(message) = set_sink_input_mute(route.id, saved.muted) {
-                    return vec![BackendEvent::BackendError { message }];
-                }
-                reapplied_settings = true;
-            }
-        }
-
-        if reapplied_settings {
-            routes = match list_app_routes() {
-                Ok(routes) => routes,
-                Err(message) => return vec![BackendEvent::BackendError { message }],
-            };
-        }
-
-        vec![BackendEvent::AppRoutesUpdated { routes }]
-    }
 }
 
 impl Drop for PipeWireDiscoveryBackend {
     fn drop(&mut self) {
+        self.stop_app_route_subscription();
+        self.device_discovery_worker.stop();
+        self.app_route_refresh_worker.stop();
+        self.control_worker.stop();
         self.clear_all_routes();
         self.stop_all_meter_taps();
         self.destroy_virtual_endpoints();
@@ -1388,6 +1877,147 @@ impl StripMeterTap {
             let _ = handle.join();
         }
     }
+}
+
+impl AppRouteSubscription {
+    fn spawn() -> Self {
+        let dirty = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let child_slot = Arc::new(Mutex::new(None));
+
+        let thread_dirty = Arc::clone(&dirty);
+        let thread_stop = Arc::clone(&stop);
+        let thread_child_slot = Arc::clone(&child_slot);
+
+        let handle = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                let mut command = Command::new("pactl");
+                command.arg("subscribe");
+                command.stdout(Stdio::piped());
+                command.stderr(Stdio::null());
+
+                let mut child = match command.spawn() {
+                    Ok(child) => child,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                };
+
+                let Some(stdout) = child.stdout.take() else {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                };
+
+                {
+                    let mut slot = thread_child_slot
+                        .lock()
+                        .expect("app route child slot mutex should not be poisoned");
+                    *slot = Some(child);
+                }
+
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                while !thread_stop.load(Ordering::Relaxed) {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if line.contains("sink-input") {
+                                thread_dirty.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                if let Some(mut child) = thread_child_slot
+                    .lock()
+                    .expect("app route child slot mutex should not be poisoned")
+                    .take()
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+
+                if !thread_stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(150));
+                }
+            }
+        });
+
+        Self {
+            dirty,
+            stop,
+            child_slot,
+            handle: Some(handle),
+        }
+    }
+
+    fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::Relaxed)
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(mut child) = self
+            .child_slot
+            .lock()
+            .expect("app route child slot mutex should not be poisoned")
+            .take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn refresh_app_routes_in_background(
+    remembered_routes: &[RememberedAppRouteState],
+) -> Result<Vec<AppRouteState>, String> {
+    let mut routes = list_app_routes()?;
+    let mut reapplied_settings = false;
+
+    for route in &routes {
+        let identity = app_route_identity(&route.name, &route.detail);
+        let Some(saved) = remembered_routes
+            .iter()
+            .find(|saved| app_route_identity(&saved.name, &saved.detail) == identity)
+        else {
+            continue;
+        };
+
+        if !saved.target.is_empty() && saved.target != route.target {
+            move_sink_input_to_target(route.id, &saved.target)?;
+            reapplied_settings = true;
+        }
+        if (saved.level - route.level).abs() > 0.01 {
+            set_sink_input_volume(route.id, saved.level)?;
+            reapplied_settings = true;
+        }
+        if saved.muted != route.muted {
+            set_sink_input_mute(route.id, saved.muted)?;
+            reapplied_settings = true;
+        }
+    }
+
+    if reapplied_settings {
+        routes = list_app_routes()?;
+    }
+    Ok(routes)
+}
+
+fn app_route_identity(name: &str, detail: &str) -> String {
+    format!(
+        "{}\u{1f}{}",
+        name.trim().to_lowercase(),
+        detail.trim().to_lowercase()
+    )
 }
 
 fn discover_device_nodes() -> Result<(Vec<PipeWireDeviceNode>, Vec<PipeWireDeviceNode>), String> {
@@ -1595,14 +2225,16 @@ where
 
 fn has_complete_virtual_layout(nodes: &[VirtualEndpointNode]) -> bool {
     VIRTUAL_INPUT_ENDPOINTS.iter().all(|spec| {
-        nodes.iter().any(|node| {
-            node.name == spec.node_name && node.media_class == spec.media_class
-        })
+        nodes
+            .iter()
+            .any(|node| node.name == spec.node_name && node.media_class == spec.media_class)
     }) && VIRTUAL_BUS_ENDPOINTS.iter().all(|spec| {
-        nodes.iter().any(|node| node.name == spec.sink_node_name && node.media_class == "Audio/Sink")
-            && nodes
-                .iter()
-                .any(|node| node.name == spec.source_node_name && node.media_class == "Audio/Source")
+        nodes
+            .iter()
+            .any(|node| node.name == spec.sink_node_name && node.media_class == "Audio/Sink")
+            && nodes.iter().any(|node| {
+                node.name == spec.source_node_name && node.media_class == "Audio/Source"
+            })
     })
 }
 
@@ -1614,9 +2246,9 @@ fn is_managed_virtual_node(node_name: &str) -> bool {
     VIRTUAL_INPUT_ENDPOINTS
         .iter()
         .any(|spec| spec.node_name == node_name)
-        || VIRTUAL_BUS_ENDPOINTS.iter().any(|spec| {
-            spec.sink_node_name == node_name || spec.source_node_name == node_name
-        })
+        || VIRTUAL_BUS_ENDPOINTS
+            .iter()
+            .any(|spec| spec.sink_node_name == node_name || spec.source_node_name == node_name)
         || matches!(node_name, "voicewire.b1" | "voicewire.b2" | "voicewire.b3")
 }
 
@@ -1645,9 +2277,7 @@ fn list_virtual_bus_modules() -> Result<Vec<PulseModuleRecord>, String> {
             args.contains(&format!("sink_name={}", spec.sink_node_name))
                 || args.contains(&format!("source_name={}", spec.source_node_name))
         }) {
-            modules.push(PulseModuleRecord {
-                id,
-            });
+            modules.push(PulseModuleRecord { id });
         }
     }
 
@@ -1686,28 +2316,52 @@ where
 }
 
 fn set_pulse_node_volume(kind: &str, name: &str, volume: &str) {
+    let _ = set_pulse_node_volume_checked(kind, name, volume);
+}
+
+fn set_pulse_node_volume_checked(kind: &str, name: &str, volume: &str) -> Result<(), String> {
     let command = match kind {
         "sink" => "set-sink-volume",
         "source" => "set-source-volume",
-        _ => return,
+        _ => return Err(format!("unsupported Pulse node kind \"{kind}\"")),
     };
 
-    let _ = Command::new("pactl")
+    let output = Command::new("pactl")
         .args([command, name, volume])
-        .output();
+        .output()
+        .map_err(|error| format!("failed to set {kind} volume for {name}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "pactl {command} failed for {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
 }
 
 fn set_pulse_node_mute(kind: &str, name: &str, muted: bool) {
+    let _ = set_pulse_node_mute_checked(kind, name, muted);
+}
+
+fn set_pulse_node_mute_checked(kind: &str, name: &str, muted: bool) -> Result<(), String> {
     let command = match kind {
         "sink" => "set-sink-mute",
         "source" => "set-source-mute",
-        _ => return,
+        _ => return Err(format!("unsupported Pulse node kind \"{kind}\"")),
     };
 
     let value = if muted { "1" } else { "0" };
-    let _ = Command::new("pactl")
+    let output = Command::new("pactl")
         .args([command, name, value])
-        .output();
+        .output()
+        .map_err(|error| format!("failed to set {kind} mute for {name}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "pactl {command} failed for {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
 }
 
 fn list_app_routes() -> Result<Vec<AppRouteState>, String> {
@@ -1718,7 +2372,10 @@ fn list_app_routes() -> Result<Vec<AppRouteState>, String> {
         .map_err(|error| format!("failed to list Pulse sink inputs: {error}"))?;
 
     if !output.status.success() {
-        return Err(format!("pactl sink-input listing failed with status {}", output.status));
+        return Err(format!(
+            "pactl sink-input listing failed with status {}",
+            output.status
+        ));
     }
 
     let inputs: Value = serde_json::from_slice(&output.stdout)
@@ -1729,26 +2386,27 @@ fn list_app_routes() -> Result<Vec<AppRouteState>, String> {
 
     let mut routes = Vec::new();
     for entry in entries {
-        let Some(id) = entry.get("index").and_then(Value::as_u64).map(|value| value as u32) else {
+        let Some(id) = entry
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+        else {
             continue;
         };
 
         let sink_name = entry
             .get("sink")
             .and_then(Value::as_u64)
-            .and_then(|sink_index| sink_index_by_name.iter().find_map(|(name, index)| {
-                (*index == sink_index as u32).then(|| name.clone())
-            }))
+            .and_then(|sink_index| {
+                sink_index_by_name
+                    .iter()
+                    .find_map(|(name, index)| (*index == sink_index as u32).then(|| name.clone()))
+            })
             .unwrap_or_default();
 
-        let props = entry
-            .get("properties")
-            .and_then(Value::as_object);
+        let props = entry.get("properties").and_then(Value::as_object);
         let level = sink_input_volume_level(entry);
-        let muted = entry
-            .get("mute")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let muted = entry.get("mute").and_then(Value::as_bool).unwrap_or(false);
         let app_name = props
             .and_then(|props| props.get("application.name"))
             .and_then(Value::as_str)
@@ -1793,7 +2451,10 @@ fn list_sink_index_by_name() -> Result<Vec<(String, u32)>, String> {
         .map_err(|error| format!("failed to list Pulse sinks: {error}"))?;
 
     if !output.status.success() {
-        return Err(format!("pactl sink listing failed with status {}", output.status));
+        return Err(format!(
+            "pactl sink listing failed with status {}",
+            output.status
+        ));
     }
 
     let sinks: Value = serde_json::from_slice(&output.stdout)
@@ -1804,7 +2465,11 @@ fn list_sink_index_by_name() -> Result<Vec<(String, u32)>, String> {
 
     let mut sink_indexes = Vec::new();
     for entry in entries {
-        let Some(index) = entry.get("index").and_then(Value::as_u64).map(|value| value as u32) else {
+        let Some(index) = entry
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+        else {
             continue;
         };
         let Some(name) = entry.get("name").and_then(Value::as_str) else {
@@ -1866,14 +2531,22 @@ fn display_app_name(app_name: &str, media_name: &str, binary_name: &str, id: u32
     format!("App {id}")
 }
 
-fn display_app_detail(app_name: &str, media_name: &str, binary_name: &str, display_name: &str) -> String {
+fn display_app_detail(
+    app_name: &str,
+    media_name: &str,
+    binary_name: &str,
+    display_name: &str,
+) -> String {
     for candidate in [media_name, app_name, binary_name] {
         let normalized = if candidate == binary_name {
             humanize_binary_name(candidate)
         } else {
             candidate.trim().to_string()
         };
-        if !normalized.is_empty() && normalized != display_name && !is_technical_stream_name(candidate) {
+        if !normalized.is_empty()
+            && normalized != display_name
+            && !is_technical_stream_name(candidate)
+        {
             return normalized;
         }
     }
@@ -1885,23 +2558,26 @@ fn normalized_app_name(primary: &str, binary_name: &str) -> Option<String> {
     if trimmed.is_empty() || is_technical_stream_name(trimmed) {
         return (!binary_name.is_empty()).then(|| humanize_binary_name(binary_name));
     }
-    Some(if trimmed.chars().all(|character| !character.is_lowercase()) {
-        trimmed.to_string()
-    } else if trimmed == trimmed.to_lowercase() {
-        humanize_binary_name(trimmed)
-    } else {
-        trimmed.to_string()
-    })
+    Some(
+        if trimmed.chars().all(|character| !character.is_lowercase()) {
+            trimmed.to_string()
+        } else if trimmed == trimmed.to_lowercase() {
+            humanize_binary_name(trimmed)
+        } else {
+            trimmed.to_string()
+        },
+    )
 }
 
 fn humanize_binary_name(name: &str) -> String {
-    name
-        .split(|character: char| !character.is_ascii_alphanumeric())
+    name.split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|part| !part.is_empty())
         .map(|part| {
             let mut chars = part.chars();
             match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+                Some(first) => {
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                }
                 None => String::new(),
             }
         })
@@ -1958,10 +2634,12 @@ fn app_badge(name: &str, app_name: &str, binary_name: &str) -> (String, String) 
         letters = "--".into();
     }
 
-    let palette = ["#5b463b", "#4c5f79", "#5a6b45", "#6b4b66", "#4f5b4b", "#6a5b3f"];
-    let hash = base
-        .bytes()
-        .fold(0_u32, |accumulator, value| accumulator.wrapping_mul(31).wrapping_add(value as u32));
+    let palette = [
+        "#5b463b", "#4c5f79", "#5a6b45", "#6b4b66", "#4f5b4b", "#6a5b3f",
+    ];
+    let hash = base.bytes().fold(0_u32, |accumulator, value| {
+        accumulator.wrapping_mul(31).wrapping_add(value as u32)
+    });
     let color = palette[(hash as usize) % palette.len()].to_string();
 
     (letters, color)
@@ -2007,31 +2685,11 @@ fn set_sink_input_mute(app_id: u32, muted: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn find_sink_input_muted(app_id: u32) -> Result<bool, String> {
-    let output = Command::new("pactl")
-        .args(["--format=json", "list", "sink-inputs"])
-        .output()
-        .map_err(|error| format!("failed to list Pulse sink inputs: {error}"))?;
-
-    if !output.status.success() {
-        return Err(format!("pactl sink-input listing failed with status {}", output.status));
-    }
-
-    let inputs: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("failed to parse Pulse sink-input json: {error}"))?;
-    let entries = inputs
-        .as_array()
-        .ok_or_else(|| "Pulse sink-input output was not a json array".to_string())?;
-
-    entries
-        .iter()
-        .find(|entry| entry.get("index").and_then(Value::as_u64) == Some(app_id as u64))
-        .and_then(|entry| entry.get("mute").and_then(Value::as_bool))
-        .ok_or_else(|| format!("could not find sink input {app_id}"))
-}
-
 fn push_unique_node(list: &mut Vec<PipeWireDeviceNode>, item: PipeWireDeviceNode) {
-    if !list.iter().any(|existing| existing.stable_id == item.stable_id) {
+    if !list
+        .iter()
+        .any(|existing| existing.stable_id == item.stable_id)
+    {
         list.push(item);
     }
 }
@@ -2081,9 +2739,20 @@ fn db_to_meter_scale(gain_db: f32, floor: f32) -> f32 {
     ((gain_db + 60.0) / 72.0).clamp(floor, 1.0)
 }
 
-fn db_to_pulse_volume(gain_db: &f32) -> String {
-    let linear = 10_f32.powf(gain_db.clamp(-60.0, 12.0) / 20.0);
-    format!("{:.1}%", (linear * 100.0).clamp(0.0, 400.0))
+fn gate_open_threshold(gate: f32) -> f32 {
+    let threshold_db = -60.0 + gate.clamp(0.0, 10.0) * 4.2;
+    10_f32.powf(threshold_db / 20.0)
+}
+
+fn gate_hold_duration(gate: f32) -> Duration {
+    let millis = 140.0 + gate.clamp(0.0, 10.0) * 28.0;
+    Duration::from_millis(millis.round() as u64)
+}
+
+fn pulse_volume_arg_for_gain_db(gain_db: f32) -> String {
+    let gain_db = gain_db.clamp(-60.0, 12.0);
+    let linear = 10_f32.powf(gain_db / 20.0);
+    format!("{linear:.5}")
 }
 
 fn resolve_output_ports(node_name: &str) -> Result<Vec<String>, String> {
@@ -2252,7 +2921,8 @@ fn build_hardware_input_mono_links(
 }
 
 fn links_for_all_ports(ports: &[String], dest: &str) -> Vec<RouteLink> {
-    ports.iter()
+    ports
+        .iter()
         .cloned()
         .map(|source_port| RouteLink {
             source_port,
@@ -2303,7 +2973,10 @@ fn find_link_ids(source_port: &str, dest_port: &str) -> Result<Vec<u32>, String>
         .map_err(|error| format!("failed to inspect PipeWire links: {error}"))?;
 
     if !output.status.success() {
-        return Err(format!("pw-link -I -l exited with status {}", output.status));
+        return Err(format!(
+            "pw-link -I -l exited with status {}",
+            output.status
+        ));
     }
 
     let mut current_port = String::new();
@@ -2388,7 +3061,7 @@ fn prop_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_dump_device_nodes, PipeWireDeviceNode, PipeWireDiscoveryBackend};
+    use super::{PipeWireDeviceNode, PipeWireDiscoveryBackend, parse_dump_device_nodes};
     use crate::backend::BackendEvent;
     use crate::model::EndpointKind;
 
@@ -2511,6 +3184,14 @@ mod tests {
     }
 
     #[test]
+    fn gain_db_converts_to_absolute_linear_factor() {
+        assert_eq!(super::pulse_volume_arg_for_gain_db(0.0), "1.00000");
+        assert_eq!(super::pulse_volume_arg_for_gain_db(-40.0), "0.01000");
+        assert_eq!(super::pulse_volume_arg_for_gain_db(-60.0), "0.00100");
+        assert_eq!(super::pulse_volume_arg_for_gain_db(12.0), "3.98107");
+    }
+
+    #[test]
     fn bind_hardware_bus_resolves_real_output_node() {
         let mut backend = PipeWireDiscoveryBackend::default();
         backend.known_output_nodes = vec![PipeWireDeviceNode {
@@ -2566,6 +3247,7 @@ mod tests {
             BackendEvent::VirtualEndpointsReady { .. } => "VirtualEndpointsReady",
             BackendEvent::RouteChanged { .. } => "RouteChanged",
             BackendEvent::StripGainChanged { .. } => "StripGainChanged",
+            BackendEvent::StripGateChanged { .. } => "StripGateChanged",
             BackendEvent::BusGainChanged { .. } => "BusGainChanged",
             BackendEvent::StripMutedChanged { .. } => "StripMutedChanged",
             BackendEvent::StripSoloChanged { .. } => "StripSoloChanged",
@@ -2575,6 +3257,7 @@ mod tests {
             BackendEvent::BusBindingChanged { .. } => "BusBindingChanged",
             BackendEvent::VirtualAppLevelChanged { .. } => "VirtualAppLevelChanged",
             BackendEvent::VirtualAppMutedChanged { .. } => "VirtualAppMutedChanged",
+            BackendEvent::AppRoutesUpdated { .. } => "AppRoutesUpdated",
             BackendEvent::MetersUpdated { .. } => "MetersUpdated",
             BackendEvent::BackendError { .. } => "BackendError",
             BackendEvent::ConnectionStateChanged { .. } => "ConnectionStateChanged",

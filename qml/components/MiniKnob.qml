@@ -5,6 +5,8 @@ Item {
     id: root
 
     required property string label
+    signal moved(real nextValue)
+    signal released(real nextValue)
     property real value: 0.0
     property real from: -1.0
     property real to: 1.0
@@ -15,6 +17,7 @@ Item {
     property color borderColor: "#353535"
     property color faceColor: "#232323"
     property bool bipolar: false
+    readonly property bool pressed: knobMouseArea.pressed
 
     implicitWidth: 42
     implicitHeight: 50
@@ -66,6 +69,7 @@ Item {
         }
 
         MouseArea {
+            id: knobMouseArea
             anchors.fill: parent
             cursorShape: Qt.SizeVerCursor
             property real lastY: 0
@@ -74,13 +78,21 @@ Item {
                 const delta = (lastY - mouse.y) / 140
                 root.applyDelta(delta)
                 lastY = mouse.y
+                root.moved(root.value)
             }
-            onDoubleClicked: root.value = root.defaultValue
+            onReleased: root.released(root.value)
+            onDoubleClicked: {
+                root.value = root.defaultValue
+                root.moved(root.value)
+                root.released(root.value)
+            }
         }
 
         WheelHandler {
             onWheel: function(event) {
                 root.applyDelta(event.angleDelta.y / 2400)
+                root.moved(root.value)
+                root.released(root.value)
             }
         }
     }

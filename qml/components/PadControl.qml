@@ -12,6 +12,9 @@ Rectangle {
     property int modeIndex: 0
     property real pointX: 0.5
     property real pointY: 1.0
+    property int defaultModeIndex: 0
+    property real defaultPointX: 0.5
+    property real defaultPointY: 1.0
     property color accentColor: "#ef8f7b"
     property color textColor: "#ece7e2"
     property color mutedTextColor: "#8d979f"
@@ -114,6 +117,12 @@ Rectangle {
                 onPositionChanged: function(mouse) {
                     if (pressedButtons & Qt.LeftButton)
                         updatePoint(mouse.x, mouse.y)
+                }
+
+                onDoubleClicked: {
+                    root.modeIndex = root.defaultModeIndex
+                    root.pointX = root.defaultPointX
+                    root.pointY = root.defaultPointY
                 }
             }
         }

@@ -222,6 +222,11 @@ Item {
                             if (pressed)
                                 updatePoint(mouse.x, mouse.y)
                         }
+
+                        onDoubleClicked: {
+                            root.panX = 0.5
+                            root.panY = 0.5
+                        }
                     }
                 }
             }

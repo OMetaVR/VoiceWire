@@ -40,17 +40,43 @@ Item {
         && titleTextMetrics.tightBoundingRect.width > titleViewport.width
     property real marqueeOffset: 0
     property real liveLevel: Number(root.appData && root.appData.level !== undefined ? root.appData.level : 0)
+    property bool levelCommitPending: false
+    property real pendingLevelValue: liveLevel
+    property bool previewDirty: false
+    property real previewLevelValue: liveLevel
 
     implicitHeight: 22
 
     onAppDataChanged: {
+        const modelValue = Number(root.appData && root.appData.level !== undefined ? root.appData.level : 0)
+        if (levelCommitPending) {
+            if (Math.abs(modelValue - pendingLevelValue) <= 0.01) {
+                levelCommitPending = false
+                liveLevel = modelValue
+            }
+            return
+        }
+
         if (!appSlider.pressed)
-            liveLevel = Number(root.appData && root.appData.level !== undefined ? root.appData.level : 0)
+            liveLevel = modelValue
     }
 
     onMarqueeRunningChanged: {
         if (!marqueeRunning)
             marqueeOffset = 0
+    }
+
+    Timer {
+        interval: 16
+        repeat: true
+        running: appSlider.pressed
+        onTriggered: {
+            if (!root.previewDirty)
+                return
+
+            root.previewDirty = false
+            root.controller.preview_app_level(root.safeAppData.id, root.previewLevelValue)
+        }
     }
 
     Column {
@@ -197,13 +223,20 @@ Item {
                 id: appSlider
                 width: parent.width - muteButton.width - parent.spacing
                 anchors.verticalCenter: parent.verticalCenter
+                defaultValue: 1.0
                 value: root.liveLevel
                 fillColor: "#7f9d88"
                 onMoved: function(nextValue) {
+                    root.levelCommitPending = false
                     root.liveLevel = nextValue
+                    root.previewLevelValue = nextValue
+                    root.previewDirty = true
                 }
                 onReleased: function(nextValue) {
                     root.liveLevel = nextValue
+                    root.pendingLevelValue = nextValue
+                    root.levelCommitPending = true
+                    root.previewDirty = false
                     root.controller.set_app_level(root.safeAppData.id, nextValue)
                 }
             }

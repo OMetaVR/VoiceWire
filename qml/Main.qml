@@ -49,13 +49,6 @@ ApplicationWindow {
         onTriggered: mixer.refresh_app_routes()
     }
 
-    Timer {
-        interval: 1500
-        running: window.visible && !quickRouteTracker.active
-        repeat: true
-        onTriggered: mixer.refresh_app_routes()
-    }
-
     property var sessionState: {
         try {
             return JSON.parse(mixer.state_json)

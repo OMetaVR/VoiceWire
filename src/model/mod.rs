@@ -74,6 +74,7 @@ pub struct StripState {
     pub header_name: String,
     pub header_detail: String,
     pub gain_db: f32,
+    pub gate: f32,
     pub muted: bool,
     pub solo: bool,
     pub mono: bool,
@@ -246,7 +247,10 @@ impl SessionState {
             .into_iter()
             .enumerate()
             .map(
-                |(index, (title, subtitle, device_name, header_name, header_detail, is_hardware))| {
+                |(
+                    index,
+                    (title, subtitle, device_name, header_name, header_detail, is_hardware),
+                )| {
                     let apps = if is_hardware {
                         Vec::new()
                     } else {
@@ -285,6 +289,7 @@ impl SessionState {
                         header_name: header_name.into(),
                         header_detail: header_detail.into(),
                         gain_db: if index == 0 { -2.0 } else { 0.0 },
+                        gate: 0.0,
                         muted: false,
                         solo: false,
                         mono: false,
@@ -297,13 +302,7 @@ impl SessionState {
                                 label: (*label).into(),
                                 enabled: matches!(
                                     (index, bus_index),
-                                    (0, 0)
-                                        | (0, 3)
-                                        | (3, 0)
-                                        | (4, 1)
-                                        | (4, 4)
-                                        | (5, 0)
-                                        | (5, 3)
+                                    (0, 0) | (0, 3) | (3, 0) | (4, 1) | (4, 4) | (5, 0) | (5, 3)
                                 ),
                             })
                             .collect(),
@@ -329,30 +328,32 @@ impl SessionState {
 
         let buses = bus_specs
             .into_iter()
-            .map(|(title, subtitle, destination_name, can_assign_device)| BusState {
-                title: title.into(),
-                subtitle: subtitle.into(),
-                destination_name: destination_name.into(),
-                device_options: if can_assign_device {
-                    hardware_outputs.clone()
-                } else {
-                    vec![demo_device(
-                        destination_name,
-                        EndpointKind::VirtualOutput,
-                        destination_name.to_lowercase().replace(' ', "-").as_str(),
-                        "virtual-capture",
-                    )]
+            .map(
+                |(title, subtitle, destination_name, can_assign_device)| BusState {
+                    title: title.into(),
+                    subtitle: subtitle.into(),
+                    destination_name: destination_name.into(),
+                    device_options: if can_assign_device {
+                        hardware_outputs.clone()
+                    } else {
+                        vec![demo_device(
+                            destination_name,
+                            EndpointKind::VirtualOutput,
+                            destination_name.to_lowercase().replace(' ', "-").as_str(),
+                            "virtual-capture",
+                        )]
+                    },
+                    gain_db: 0.0,
+                    muted: false,
+                    meter_left: 0.0,
+                    meter_right: 0.0,
+                    endpoint_kind: if can_assign_device {
+                        EndpointKind::HardwareOutput
+                    } else {
+                        EndpointKind::VirtualOutput
+                    },
                 },
-                gain_db: 0.0,
-                muted: false,
-                meter_left: 0.0,
-                meter_right: 0.0,
-                endpoint_kind: if can_assign_device {
-                    EndpointKind::HardwareOutput
-                } else {
-                    EndpointKind::VirtualOutput
-                },
-            })
+            )
             .collect();
 
         let app_routes = vec![
@@ -487,6 +488,12 @@ impl SessionState {
         }
     }
 
+    pub fn set_strip_gate(&mut self, strip_index: usize, gate: f32) {
+        if let Some(strip) = self.strips.get_mut(strip_index) {
+            strip.gate = gate.clamp(0.0, 10.0);
+        }
+    }
+
     pub fn set_bus_gain(&mut self, bus_index: usize, gain_db: f32) {
         if let Some(bus) = self.buses.get_mut(bus_index) {
             bus.gain_db = gain_db.clamp(-60.0, 12.0);
@@ -533,7 +540,10 @@ impl SessionState {
         let previous_routes = self.app_routes.clone();
         let mut normalized_routes = routes;
         for route in &mut normalized_routes {
-            if let Some(previous) = previous_routes.iter().find(|candidate| candidate.id == route.id) {
+            if let Some(previous) = previous_routes
+                .iter()
+                .find(|candidate| candidate.id == route.id)
+            {
                 if route.name.is_empty() {
                     route.name = previous.name.clone();
                 }
@@ -594,16 +604,6 @@ impl SessionState {
 
     pub fn set_remembered_app_routes(&mut self, routes: Vec<RememberedAppRouteState>) {
         self.remembered_app_routes = routes;
-    }
-
-    pub fn remembered_app_route_for(
-        &self,
-        route: &AppRouteState,
-    ) -> Option<&RememberedAppRouteState> {
-        self.remembered_app_routes.iter().find(|candidate| {
-            app_route_identity_key(&candidate.name, &candidate.detail)
-                == app_route_identity_key(&route.name, &route.detail)
-        })
     }
 
     pub fn set_quick_route_enabled(&mut self, enabled: bool) {
@@ -716,8 +716,7 @@ impl SessionState {
 
             let left =
                 (base * ((phase + strip_index as f32 * 0.8).sin() * 0.12 + 0.88)).clamp(0.0, 1.0);
-            let right = (base
-                * ((phase + strip_index as f32 * 0.8 + 0.9).sin() * 0.12 + 0.86))
+            let right = (base * ((phase + strip_index as f32 * 0.8 + 0.9).sin() * 0.12 + 0.86))
                 .clamp(0.0, 1.0);
 
             let levels = if strip.mono {
@@ -739,10 +738,10 @@ impl SessionState {
                     if strip.muted || app.muted {
                         0.0
                     } else {
-                        let flutter =
-                            (phase + strip_index as f32 * 0.7 + app_index as f32 * 0.52).sin()
-                                * 0.12
-                                + 0.28;
+                        let flutter = (phase + strip_index as f32 * 0.7 + app_index as f32 * 0.52)
+                            .sin()
+                            * 0.12
+                            + 0.28;
                         (app.level * flutter).clamp(0.0, 1.0)
                     }
                 })
@@ -756,14 +755,26 @@ impl SessionState {
                 .strips
                 .iter()
                 .zip(strip_meters.iter())
-                .filter(|(strip, _)| strip.routes.get(bus_index).is_some_and(|route| route.enabled))
-                .map(|(strip, levels)| levels.left * ((strip.gain_db + 60.0) / 72.0).clamp(0.2, 1.0))
+                .filter(|(strip, _)| {
+                    strip
+                        .routes
+                        .get(bus_index)
+                        .is_some_and(|route| route.enabled)
+                })
+                .map(|(strip, levels)| {
+                    levels.left * ((strip.gain_db + 60.0) / 72.0).clamp(0.2, 1.0)
+                })
                 .sum();
             let input_right: f32 = self
                 .strips
                 .iter()
                 .zip(strip_meters.iter())
-                .filter(|(strip, _)| strip.routes.get(bus_index).is_some_and(|route| route.enabled))
+                .filter(|(strip, _)| {
+                    strip
+                        .routes
+                        .get(bus_index)
+                        .is_some_and(|route| route.enabled)
+                })
                 .map(|(strip, levels)| {
                     levels.right * ((strip.gain_db + 60.0) / 72.0).clamp(0.2, 1.0)
                 })
@@ -825,7 +836,12 @@ fn app_route_identity_key(name: &str, detail: &str) -> String {
     )
 }
 
-fn demo_device(name: &str, kind: EndpointKind, stable_id: &str, device_class: &str) -> DeviceOption {
+fn demo_device(
+    name: &str,
+    kind: EndpointKind,
+    stable_id: &str,
+    device_class: &str,
+) -> DeviceOption {
     DeviceOption {
         name: name.into(),
         kind,

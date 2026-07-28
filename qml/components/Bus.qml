@@ -20,6 +20,10 @@ Rectangle {
     readonly property color dangerColor: "#a15a52"
     readonly property bool isHardwareBus: root.busIndex < 3
     property real liveGainValue: Number(root.busData && root.busData.gainDb !== undefined ? root.busData.gainDb : 0)
+    property bool gainCommitPending: false
+    property real pendingGainValue: liveGainValue
+    property bool previewDirty: false
+    property real previewGainValue: liveGainValue
 
     color: root.surfaceColor
     radius: 4
@@ -27,8 +31,32 @@ Rectangle {
     clip: true
 
     onBusDataChanged: {
+        const modelValue = Number(root.busData && root.busData.gainDb !== undefined ? root.busData.gainDb : 0)
+        if (gainCommitPending) {
+            if (Math.abs(modelValue - pendingGainValue) <= 0.01) {
+                gainCommitPending = false
+                liveGainValue = modelValue
+            }
+            return
+        }
+
         if (!gainSlider.pressed)
-            liveGainValue = Number(root.busData && root.busData.gainDb !== undefined ? root.busData.gainDb : 0)
+            liveGainValue = modelValue
+    }
+
+    Timer {
+        id: gainPreviewTimer
+
+        interval: 16
+        repeat: true
+        running: gainSlider.pressed
+        onTriggered: {
+            if (!root.previewDirty)
+                return
+
+            root.previewDirty = false
+            root.controller.preview_bus_gain(root.busIndex, root.previewGainValue)
+        }
     }
 
     ColumnLayout {
@@ -99,16 +127,22 @@ Rectangle {
                     from: -60
                     to: 12
                     stepSize: 0.5
+                    defaultValue: 0
                     value: root.liveGainValue
                     fillColor: root.fillColor
                     trackColor: "#101010"
                     borderColor: root.edgeColor
                     onMoved: function(nextValue) {
+                        root.gainCommitPending = false
                         root.liveGainValue = nextValue
-                        root.controller.preview_bus_gain(root.busIndex, nextValue)
+                        root.previewGainValue = nextValue
+                        root.previewDirty = true
                     }
                     onReleased: function(nextValue) {
                         root.liveGainValue = nextValue
+                        root.pendingGainValue = nextValue
+                        root.gainCommitPending = true
+                        root.previewDirty = false
                         root.controller.set_bus_gain(root.busIndex, nextValue)
                     }
                 }

@@ -22,9 +22,9 @@ impl AudioBackend for MockBackend {
                 },
                 self.next_meter_event(session),
             ],
-            BackendCommand::PreviewStripGain { .. } | BackendCommand::PreviewBusGain { .. } => {
-                Vec::new()
-            }
+            BackendCommand::PreviewStripGain { .. }
+            | BackendCommand::PreviewBusGain { .. }
+            | BackendCommand::PreviewAppLevel { .. } => Vec::new(),
             BackendCommand::Shutdown => vec![
                 BackendEvent::ConnectionStateChanged { connected: false },
                 BackendEvent::VirtualEndpointsReady { ready: false },
@@ -64,49 +64,76 @@ impl AudioBackend for MockBackend {
                         .unwrap_or(gain_db),
                 }]
             }),
-            BackendCommand::SetBusGain { bus_index, gain_db } => self.with_temp_session(session, |temp| {
-                temp.set_bus_gain(bus_index, gain_db);
-                vec![BackendEvent::BusGainChanged {
-                    bus_index,
-                    gain_db: temp.buses.get(bus_index).map(|bus| bus.gain_db).unwrap_or(gain_db),
-                }]
-            }),
-            BackendCommand::ToggleStripMuted { strip_index } => self.with_temp_session(session, |temp| {
-                let muted = temp
-                    .strips
-                    .get(strip_index)
-                    .map(|strip| !strip.muted)
-                    .unwrap_or(false);
-                temp.set_strip_muted(strip_index, muted);
-                vec![BackendEvent::StripMutedChanged { strip_index, muted }]
-            }),
-            BackendCommand::ToggleStripSolo { strip_index } => self.with_temp_session(session, |temp| {
-                let solo = temp
-                    .strips
-                    .get(strip_index)
-                    .map(|strip| !strip.solo)
-                    .unwrap_or(false);
-                temp.set_strip_solo(strip_index, solo);
-                vec![BackendEvent::StripSoloChanged { strip_index, solo }]
-            }),
-            BackendCommand::ToggleStripMono { strip_index } => self.with_temp_session(session, |temp| {
-                let mono = temp
-                    .strips
-                    .get(strip_index)
-                    .map(|strip| !strip.mono)
-                    .unwrap_or(false);
-                temp.set_strip_mono(strip_index, mono);
-                vec![BackendEvent::StripMonoChanged { strip_index, mono }]
-            }),
-            BackendCommand::ToggleBusMuted { bus_index } => self.with_temp_session(session, |temp| {
-                let muted = temp
-                    .buses
-                    .get(bus_index)
-                    .map(|bus| !bus.muted)
-                    .unwrap_or(false);
-                temp.set_bus_muted(bus_index, muted);
-                vec![BackendEvent::BusMutedChanged { bus_index, muted }]
-            }),
+            BackendCommand::SetStripGate { strip_index, gate } => {
+                self.with_temp_session(session, |temp| {
+                    temp.set_strip_gate(strip_index, gate);
+                    vec![BackendEvent::StripGateChanged {
+                        strip_index,
+                        gate: temp
+                            .strips
+                            .get(strip_index)
+                            .map(|strip| strip.gate)
+                            .unwrap_or(gate),
+                    }]
+                })
+            }
+            BackendCommand::SetBusGain { bus_index, gain_db } => {
+                self.with_temp_session(session, |temp| {
+                    temp.set_bus_gain(bus_index, gain_db);
+                    vec![BackendEvent::BusGainChanged {
+                        bus_index,
+                        gain_db: temp
+                            .buses
+                            .get(bus_index)
+                            .map(|bus| bus.gain_db)
+                            .unwrap_or(gain_db),
+                    }]
+                })
+            }
+            BackendCommand::ToggleStripMuted { strip_index } => {
+                self.with_temp_session(session, |temp| {
+                    let muted = temp
+                        .strips
+                        .get(strip_index)
+                        .map(|strip| !strip.muted)
+                        .unwrap_or(false);
+                    temp.set_strip_muted(strip_index, muted);
+                    vec![BackendEvent::StripMutedChanged { strip_index, muted }]
+                })
+            }
+            BackendCommand::ToggleStripSolo { strip_index } => {
+                self.with_temp_session(session, |temp| {
+                    let solo = temp
+                        .strips
+                        .get(strip_index)
+                        .map(|strip| !strip.solo)
+                        .unwrap_or(false);
+                    temp.set_strip_solo(strip_index, solo);
+                    vec![BackendEvent::StripSoloChanged { strip_index, solo }]
+                })
+            }
+            BackendCommand::ToggleStripMono { strip_index } => {
+                self.with_temp_session(session, |temp| {
+                    let mono = temp
+                        .strips
+                        .get(strip_index)
+                        .map(|strip| !strip.mono)
+                        .unwrap_or(false);
+                    temp.set_strip_mono(strip_index, mono);
+                    vec![BackendEvent::StripMonoChanged { strip_index, mono }]
+                })
+            }
+            BackendCommand::ToggleBusMuted { bus_index } => {
+                self.with_temp_session(session, |temp| {
+                    let muted = temp
+                        .buses
+                        .get(bus_index)
+                        .map(|bus| !bus.muted)
+                        .unwrap_or(false);
+                    temp.set_bus_muted(bus_index, muted);
+                    vec![BackendEvent::BusMutedChanged { bus_index, muted }]
+                })
+            }
             BackendCommand::SetStripDevice {
                 strip_index,
                 device_name,
@@ -117,9 +144,15 @@ impl AudioBackend for MockBackend {
                     device_name,
                 }]
             }),
-            BackendCommand::SetBusDevice { bus_index, device_name } => self.with_temp_session(session, |temp| {
+            BackendCommand::SetBusDevice {
+                bus_index,
+                device_name,
+            } => self.with_temp_session(session, |temp| {
                 temp.set_bus_device(bus_index, &device_name);
-                vec![BackendEvent::BusBindingChanged { bus_index, device_name }]
+                vec![BackendEvent::BusBindingChanged {
+                    bus_index,
+                    device_name,
+                }]
             }),
             BackendCommand::SetVirtualAppLevel {
                 strip_index,
@@ -156,22 +189,26 @@ impl AudioBackend for MockBackend {
                     muted,
                 }]
             }),
-            BackendCommand::SetAppRoute { app_id, target } => self.with_temp_session(session, |temp| {
-                let mut routes = temp.app_routes.clone();
-                if let Some(route) = routes.iter_mut().find(|route| route.id == app_id) {
-                    route.target = target;
-                }
-                temp.set_app_routes(routes.clone());
-                vec![BackendEvent::AppRoutesUpdated { routes }]
-            }),
-            BackendCommand::SetAppLevel { app_id, level } => self.with_temp_session(session, |temp| {
-                let mut routes = temp.app_routes.clone();
-                if let Some(route) = routes.iter_mut().find(|route| route.id == app_id) {
-                    route.level = level.clamp(0.0, 1.0);
-                }
-                temp.set_app_routes(routes.clone());
-                vec![BackendEvent::AppRoutesUpdated { routes }]
-            }),
+            BackendCommand::SetAppRoute { app_id, target } => {
+                self.with_temp_session(session, |temp| {
+                    let mut routes = temp.app_routes.clone();
+                    if let Some(route) = routes.iter_mut().find(|route| route.id == app_id) {
+                        route.target = target;
+                    }
+                    temp.set_app_routes(routes.clone());
+                    vec![BackendEvent::AppRoutesUpdated { routes }]
+                })
+            }
+            BackendCommand::SetAppLevel { app_id, level } => {
+                self.with_temp_session(session, |temp| {
+                    let mut routes = temp.app_routes.clone();
+                    if let Some(route) = routes.iter_mut().find(|route| route.id == app_id) {
+                        route.level = level.clamp(0.0, 1.0);
+                    }
+                    temp.set_app_routes(routes.clone());
+                    vec![BackendEvent::AppRoutesUpdated { routes }]
+                })
+            }
             BackendCommand::ToggleAppMuted { app_id } => self.with_temp_session(session, |temp| {
                 let mut routes = temp.app_routes.clone();
                 if let Some(route) = routes.iter_mut().find(|route| route.id == app_id) {

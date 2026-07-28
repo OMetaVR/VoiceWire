@@ -13,6 +13,7 @@ Item {
     property color handleColor: "#d7cdb9"
     property color handleBorderColor: "#8f8575"
     property real stepSize: 0.5
+    property real defaultValue: 0.0
     property bool pressed: dragArea.pressed
     signal moved(real value)
     signal released(real value)
@@ -127,6 +128,15 @@ Item {
             if (pressed)
                 applyPosition(mouse.y)
         }
-        onReleased: root.released(root.value)
+        onReleased: function(mouse) {
+            const nextValue = root.valueFromY(mouse.y)
+            root.moved(nextValue)
+            root.released(nextValue)
+        }
+        onDoubleClicked: {
+            const nextValue = root.snappedValue(root.defaultValue)
+            root.moved(nextValue)
+            root.released(nextValue)
+        }
     }
 }

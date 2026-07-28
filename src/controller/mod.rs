@@ -27,12 +27,15 @@ impl AppController {
     }
 
     pub fn dispatch(&mut self, command: BackendCommand) {
+        let is_shutdown = matches!(&command, BackendCommand::Shutdown);
         let should_persist = should_persist_command(&command);
         let events = self.backend.handle(&self.session, command);
         for event in events {
             self.apply_event(event);
         }
-        if should_persist {
+        if is_shutdown {
+            persistence::flush_session_saves();
+        } else if should_persist {
             persistence::save_session_async(self.session.clone());
         }
     }
@@ -64,6 +67,9 @@ impl AppController {
             } => {
                 self.session.set_strip_gain(strip_index, gain_db);
             }
+            BackendEvent::StripGateChanged { strip_index, gate } => {
+                self.session.set_strip_gate(strip_index, gate);
+            }
             BackendEvent::BusGainChanged { bus_index, gain_db } => {
                 self.session.set_bus_gain(bus_index, gain_db);
             }
@@ -85,7 +91,10 @@ impl AppController {
             } => {
                 self.session.set_strip_device(strip_index, &device_name);
             }
-            BackendEvent::BusBindingChanged { bus_index, device_name } => {
+            BackendEvent::BusBindingChanged {
+                bus_index,
+                device_name,
+            } => {
                 self.session.set_bus_device(bus_index, &device_name);
             }
             BackendEvent::VirtualAppLevelChanged {
@@ -129,11 +138,13 @@ fn should_persist_command(command: &BackendCommand) -> bool {
     !matches!(
         command,
         BackendCommand::Start
+            | BackendCommand::Shutdown
             | BackendCommand::RefreshMeters
             | BackendCommand::RefreshAppRoutes
             | BackendCommand::SetVirtualAppLevel { .. }
             | BackendCommand::ToggleVirtualAppMuted { .. }
             | BackendCommand::PreviewStripGain { .. }
             | BackendCommand::PreviewBusGain { .. }
+            | BackendCommand::PreviewAppLevel { .. }
     )
 }

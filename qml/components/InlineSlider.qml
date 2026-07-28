@@ -7,6 +7,7 @@ Item {
     property alias pressed: dragArea.pressed
     property real from: 0.0
     property real to: 1.0
+    property real defaultValue: 1.0
     property color fillColor: "#8bc39f"
     property color trackColor: "#1b1b1b"
     property color borderColor: "#353535"
@@ -82,6 +83,15 @@ Item {
             if (pressed)
                 applyAt(mouse.x)
         }
-        onReleased: root.released(root.value)
+        onReleased: function(mouse) {
+            const nextValue = root.valueFromX(mouse.x)
+            root.moved(nextValue)
+            root.released(nextValue)
+        }
+        onDoubleClicked: {
+            const nextValue = root.snapped(root.defaultValue)
+            root.moved(nextValue)
+            root.released(nextValue)
+        }
     }
 }
